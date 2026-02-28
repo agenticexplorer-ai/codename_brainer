@@ -1,4 +1,4 @@
-# codename_brainer
+# agentkit
 
 `codename_brainer` contains `agentkit`, a lightweight multi-agent development orchestrator with a CLI entry point.
 
