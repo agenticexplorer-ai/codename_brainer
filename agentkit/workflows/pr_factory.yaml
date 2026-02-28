@@ -1,0 +1,17 @@
+name: pr_factory_v1
+description: "Plan -> Implement -> Review (no model calls yet)"
+stages:
+  - id: plan
+    role: planner
+    input: task
+    output: plan_json
+
+  - id: implement
+    role: implementer
+    input: plan_json
+    output: impl_report_json
+
+  - id: review
+    role: reviewer
+    input: impl_report_json
+    output: review_json

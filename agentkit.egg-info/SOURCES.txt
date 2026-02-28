@@ -9,4 +9,5 @@ agentkit.egg-info/requires.txt
 agentkit.egg-info/top_level.txt
 agentkit/runner/__init__.py
 agentkit/runner/cli.py
+agentkit/runner/loaders.py
 agentkit/tools/__init__.py
