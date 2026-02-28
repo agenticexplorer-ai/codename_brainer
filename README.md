@@ -1,110 +1,76 @@
 # codename_brainer
 
-updated readme
+`codename_brainer` contains `agentkit`, a lightweight multi-agent development orchestrator with a CLI entry point.
 
-What each is for:
-agentkit/personas/ → role definitions (Planner, Implementer, Reviewer…)
-agentkit/workflows/ → state machine / pipeline (Plan→Code→Test→Review)
-agentkit/policies/ → command allowlist, forbidden paths, approval rules
-agentkit/tools/ → wrappers for git/tests/filesystem
-agentkit/runner/ → the orchestrator CLI
-agentkit/logs/ → local run logs (gitignored)
-examples/ → sample “target repos” or demo tasks
+## Project layout
 
+- `agentkit/personas/`: role definitions (Planner, Implementer, Reviewer, etc.)
+- `agentkit/workflows/`: workflow/state-machine logic
+- `agentkit/policies/`: command and path safety rules
+- `agentkit/tools/`: wrappers for git, tests, and filesystem operations
+- `agentkit/runner/`: CLI/orchestration runtime
+- `agentkit/logs/`: local run logs (gitignored)
+- `examples/`: demo targets and sample tasks
 
-## Dev mode
+## Prerequisites
 
-### Cold start
+- Python `3.10+`
+- `git`
+- Optional: `rg` (ripgrep) for faster search
+
+## Quick start (first-time setup)
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -U pip
+pip install --upgrade pip
 pip install -e .
 agentkit doctor
+```
 
-### If you close the terminal, here’s what happens and what you need to redo.
+If setup is successful, `agentkit doctor` should report required commands and your Python version.
 
-What you DO NOT need to redo
+## Daily workflow
 
-You do not need to run again:
+For each new terminal session:
 
-python3 -m venv .venv
-pip install -e .
-
-Those only need to be done:
-
-the first time
-
-or if you delete .venv
-
-or if you recreate the environment from scratch
-
-Your .venv folder is still there on disk.
-
-What you DO need to redo
-
-Every new terminal session, you must run:
-
-source .venv/bin/activate
-
-That’s it.
-
-Why?
-
-Because activation:
-
-changes your PATH
-
-tells the shell to use the Python inside .venv
-
-makes agentkit available
-
-Without activation:
-
-agentkit may not be found
-
-pip would install globally
-
-wrong Python could run
-
-Typical daily workflow
-
-Open terminal → go to project:
-
-cd your-repo
+```bash
+cd /path/to/codename_brainer
 source .venv/bin/activate
 agentkit doctor
+```
 
-Done.
+You only need to reactivate the environment. You do not need to recreate `.venv` or reinstall every day.
 
-How to check if you're activated
+## Verify virtual environment is active
 
-Your shell prompt usually shows:
-
-(.venv) your-macbook %
-
-Or you can run:
-
+```bash
 which python
+```
 
-If activated, it should show something like:
+Expected output should point to this project, for example:
 
-.../your-repo/.venv/bin/python
-When would you recreate the venv?
+```text
+.../codename_brainer/.venv/bin/python
+```
 
-If:
+## Recreate environment (only when needed)
 
-Python version changes
+Use this only if dependencies are broken, Python changes, or you want a clean reset:
 
-Dependencies break badly
-
-You want a clean environment
-
-Then:
-
+```bash
 rm -rf .venv
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -U pip
+pip install --upgrade pip
 pip install -e .
+agentkit doctor
+```
 
-But that’s occasional, not daily.
+## CLI usage
+
+```bash
+agentkit doctor
+```
+
+If no command is provided, the CLI prints a short help hint.
