@@ -1,0 +1,26 @@
+# One command prefix per line.
+# These are used by report-level checks on implementer output.
+echo
+cat
+ls
+pwd
+test
+true
+false
+[
+if
+then
+else
+fi
+wc
+printf
+sed
+rg
+python
+python3
+pytest
+git
+touch
+mkdir
+cp
+mv

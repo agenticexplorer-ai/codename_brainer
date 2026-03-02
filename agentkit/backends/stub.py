@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 
@@ -65,8 +66,40 @@ def reviewer_stub(impl_report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# single dispatcher
-def run_role(role: str, payload: dict | str) -> dict:
+class StubBackend:
+    def __init__(self) -> None:
+        self._thread_ids: dict[str, str] = {}
+        self._last_attempt: int = 1
+        self._last_backend_error: str | None = None
+
+    def run_role(
+        self,
+        role: str,
+        persona: str,
+        input: Any,
+        repo_root: Path,
+        thread_id: str | None,
+    ) -> dict[str, Any]:
+        del persona, repo_root
+        self._last_attempt = 1
+        self._last_backend_error = None
+        if thread_id is not None:
+            self._thread_ids[role] = thread_id
+        elif role not in self._thread_ids:
+            self._thread_ids[role] = f"stub-{role}"
+        return _dispatch(role, input)
+
+    def get_thread_id(self, role: str) -> str | None:
+        return self._thread_ids.get(role)
+
+    def get_last_attempt(self) -> int:
+        return self._last_attempt
+
+    def get_last_backend_error(self) -> str | None:
+        return self._last_backend_error
+
+
+def _dispatch(role: str, payload: Any) -> dict[str, Any]:
     if role == "planner":
         return planner_stub(payload if isinstance(payload, str) else json.dumps(payload))
     if role == "implementer":
@@ -76,3 +109,14 @@ def run_role(role: str, payload: dict | str) -> dict:
         return reviewer_stub(payload if isinstance(payload, dict) else {})
     # unknown role fallback
     return {"error": f"no stub for role '{role}'"}
+
+
+def run_role(
+    role: str,
+    payload: dict | str,
+    persona: str | None = None,
+    repo_root: Path | None = None,
+    thread_id: str | None = None,
+) -> dict[str, Any]:
+    del persona, repo_root, thread_id
+    return _dispatch(role, payload)

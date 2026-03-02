@@ -1,0 +1,8 @@
+# Path fragments or prefixes that implementer-reported changes must avoid.
+.git/
+.venv/
+agentkit/logs/
+/etc/
+/usr/
+/System/
+~/.ssh/
