@@ -12,6 +12,168 @@ from typing import Any
 from agentkit.backends.base import PermissionMode
 
 ROLE_OUTPUT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "po": {
+        "oneOf": [
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["problem_statement", "goals", "constraints", "success_criteria"],
+                "properties": {
+                    "problem_statement": {"type": "string"},
+                    "goals": {"type": "array", "items": {"type": "string"}},
+                    "constraints": {"type": "array", "items": {"type": "string"}},
+                    "success_criteria": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+            {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["tasks"],
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["id", "summary", "acceptance", "dependencies"],
+                            "properties": {
+                                "id": {"type": "string"},
+                                "summary": {"type": "string"},
+                                "acceptance": {"type": "array", "items": {"type": "string"}},
+                                "dependencies": {"type": "array", "items": {"type": "string"}},
+                            },
+                        },
+                    }
+                },
+            },
+        ]
+    },
+    "principal_engineer": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "architecture_summary",
+            "design_decisions",
+            "risks",
+            "implementation_notes",
+        ],
+        "properties": {
+            "architecture_summary": {"type": "string"},
+            "design_decisions": {"type": "array", "items": {"type": "string"}},
+            "risks": {"type": "array", "items": {"type": "string"}},
+            "implementation_notes": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "developer": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["task_id", "changes", "commands_ran", "notes"],
+        "properties": {
+            "task_id": {"type": "string"},
+            "changes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["path", "type", "summary"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "type": {"type": "string"},
+                        "summary": {"type": "string"},
+                    },
+                },
+            },
+            "commands_ran": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["cmd", "exit_code", "notes"],
+                    "properties": {
+                        "cmd": {"type": "string"},
+                        "exit_code": {"type": "integer"},
+                        "notes": {"type": "string"},
+                    },
+                },
+            },
+            "notes": {"type": "string"},
+        },
+    },
+    "tester": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["verdict", "findings", "recommended_actions"],
+        "properties": {
+            "verdict": {"type": "string", "enum": ["approve", "request_changes"]},
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["severity", "text"],
+                    "properties": {
+                        "severity": {
+                            "type": "string",
+                            "enum": ["blocker", "major", "minor"],
+                        },
+                        "text": {"type": "string"},
+                    },
+                },
+            },
+            "recommended_actions": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "integrator": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["task_id", "queue_position", "conflict_check", "merge_decision", "notes"],
+        "properties": {
+            "task_id": {"type": "string"},
+            "queue_position": {"type": "integer"},
+            "conflict_check": {"type": "string", "enum": ["pass", "fail"]},
+            "merge_decision": {"type": "string", "enum": ["approve", "block"]},
+            "notes": {"type": "string"},
+        },
+    },
+    "devops": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["release_readiness", "infra_checks", "rollout_plan", "risks"],
+        "properties": {
+            "release_readiness": {"type": "string", "enum": ["ready", "not_ready"]},
+            "infra_checks": {"type": "array", "items": {"type": "string"}},
+            "rollout_plan": {"type": "array", "items": {"type": "string"}},
+            "risks": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "cicd": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "pipeline_status",
+            "checks",
+            "deployment_recommendation",
+            "summary",
+        ],
+        "properties": {
+            "pipeline_status": {"type": "string", "enum": ["pass", "fail"]},
+            "checks": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["name", "status", "notes"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "status": {"type": "string", "enum": ["pass", "fail"]},
+                        "notes": {"type": "string"},
+                    },
+                },
+            },
+            "deployment_recommendation": {"type": "string", "enum": ["proceed", "hold"]},
+            "summary": {"type": "string"},
+        },
+    },
     "planner": {
         "type": "object",
         "additionalProperties": False,
@@ -137,6 +299,10 @@ class CodexAppServerBackend:
         payload = self._normalize_input(input)
         prompt = self._build_prompt(role, persona, payload)
         schema = ROLE_OUTPUT_SCHEMAS.get(role)
+        if role == "po":
+            # PO can emit either intake or decompose shapes; keep schema validation in-agent
+            # flexible and enforce required keys in local post-parse validation.
+            schema = None
 
         for attempt in (1, 2):
             self._last_attempt = attempt
@@ -513,10 +679,35 @@ class CodexAppServerBackend:
 
     def _validate_role_output(self, role: str, payload: dict[str, Any]) -> None:
         required = {
+            "po": ["problem_statement"],
+            "principal_engineer": [
+                "architecture_summary",
+                "design_decisions",
+                "risks",
+                "implementation_notes",
+            ],
+            "developer": ["task_id", "changes", "commands_ran", "notes"],
+            "tester": ["verdict", "findings", "recommended_actions"],
+            "integrator": [
+                "task_id",
+                "queue_position",
+                "conflict_check",
+                "merge_decision",
+                "notes",
+            ],
+            "devops": ["release_readiness", "infra_checks", "rollout_plan", "risks"],
+            "cicd": [
+                "pipeline_status",
+                "checks",
+                "deployment_recommendation",
+                "summary",
+            ],
             "planner": ["summary", "steps", "risks", "done_when"],
             "implementer": ["changes", "commands_ran", "next"],
             "reviewer": ["verdict", "comments", "suggested_followups"],
         }.get(role, [])
+        if role == "po" and "tasks" in payload:
+            return
         missing = [k for k in required if k not in payload]
         if missing:
             raise ValueError(f"missing required keys for role '{role}': {', '.join(missing)}")

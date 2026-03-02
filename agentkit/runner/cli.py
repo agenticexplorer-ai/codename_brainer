@@ -10,6 +10,10 @@ from typing import Any
 
 from agentkit.backends import build_backend
 from agentkit.backends.base import BackendName, PermissionMode
+from agentkit.dashboard.server import run_dashboard
+from agentkit.orchestrator.store import list_runs, load_run
+from agentkit.orchestrator.team_runner import TeamOrchestrator
+from agentkit.orchestrator.types import AutonomyMode
 from agentkit.policies.checks import evaluate_implementer_report, load_policy_lines
 from agentkit.runner.loaders import load_text, load_workflow
 
@@ -17,14 +21,18 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 LOGS_DIR = REPO_ROOT / "agentkit" / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 POLICIES_DIR = REPO_ROOT / "agentkit" / "policies"
+STATE_RUNS_DIR = REPO_ROOT / "agentkit" / "state" / "runs"
+STATE_RUNS_DIR.mkdir(parents=True, exist_ok=True)
+
 MAX_REVIEW_RETRIES = 2
 VALID_BACKENDS: set[str] = {"stub", "codex"}
 VALID_PERMISSIONS: set[str] = {"read_only", "write_safe"}
+VALID_AUTONOMY: set[str] = {"full_auto", "mixed", "human_in_loop"}
 
 
 def doctor() -> int:
     required = ["git", "python3"]
-    optional = ["rg"]  # ripgrep helps later but not required
+    optional = ["rg", "codex"]  # codex is optional depending backend
 
     missing = [c for c in required if shutil.which(c) is None]
     if missing:
@@ -47,46 +55,16 @@ def print_run_usage() -> None:
     print(
         "Usage: agentkit run <workflow_name_without_yaml> <task>"
         " [--backend stub|codex] [--permissions read_only|write_safe]"
+        " [--autonomy full_auto|mixed|human_in_loop] [--keep-worktrees]"
     )
 
 
-def parse_run_args(args: list[str]) -> tuple[str, str, BackendName, PermissionMode] | None:
-    if len(args) < 2:
-        return None
-    workflow_name = args[0]
-    remainder = args[1:]
+def print_dashboard_usage() -> None:
+    print("Usage: agentkit dashboard [--run-id <id>] [--port <port>]")
 
-    task_parts: list[str] = []
-    idx = 0
-    while idx < len(remainder) and not remainder[idx].startswith("--"):
-        task_parts.append(remainder[idx])
-        idx += 1
 
-    if not task_parts:
-        return None
-
-    backend_flag: str | None = None
-    permissions_flag: str | None = None
-
-    while idx < len(remainder):
-        flag = remainder[idx]
-        idx += 1
-        if idx >= len(remainder):
-            return None
-        value = remainder[idx]
-        idx += 1
-
-        if flag == "--backend":
-            backend_flag = value
-            continue
-        if flag == "--permissions":
-            permissions_flag = value
-            continue
-        return None
-
-    backend = resolve_backend_name(backend_flag)
-    permissions = resolve_permissions(permissions_flag)
-    return workflow_name, " ".join(task_parts), backend, permissions
+def print_runs_usage() -> None:
+    print("Usage: agentkit runs list | agentkit runs show <run-id>")
 
 
 def resolve_backend_name(backend_flag: str | None) -> BackendName:
@@ -110,6 +88,90 @@ def resolve_permissions(permissions_flag: str | None) -> PermissionMode:
     return candidate  # type: ignore[return-value]
 
 
+def resolve_autonomy(autonomy_flag: str | None) -> AutonomyMode:
+    candidate = (autonomy_flag or os.getenv("AGENTKIT_AUTONOMY") or "mixed").strip()
+    if candidate not in VALID_AUTONOMY:
+        raise ValueError(
+            f"Invalid autonomy '{candidate}'. Allowed values: {', '.join(sorted(VALID_AUTONOMY))}"
+        )
+    return candidate  # type: ignore[return-value]
+
+
+def parse_run_args(
+    args: list[str],
+) -> tuple[str, str, BackendName, PermissionMode, AutonomyMode, bool] | None:
+    if len(args) < 2:
+        return None
+    workflow_name = args[0]
+    remainder = args[1:]
+
+    task_parts: list[str] = []
+    idx = 0
+    while idx < len(remainder) and not remainder[idx].startswith("--"):
+        task_parts.append(remainder[idx])
+        idx += 1
+
+    if not task_parts:
+        return None
+
+    backend_flag: str | None = None
+    permissions_flag: str | None = None
+    autonomy_flag: str | None = None
+    keep_worktrees = False
+
+    while idx < len(remainder):
+        flag = remainder[idx]
+        idx += 1
+        if flag == "--keep-worktrees":
+            keep_worktrees = True
+            continue
+        if idx >= len(remainder):
+            return None
+        value = remainder[idx]
+        idx += 1
+        if flag == "--backend":
+            backend_flag = value
+            continue
+        if flag == "--permissions":
+            permissions_flag = value
+            continue
+        if flag == "--autonomy":
+            autonomy_flag = value
+            continue
+        return None
+
+    backend = resolve_backend_name(backend_flag)
+    permissions = resolve_permissions(permissions_flag)
+    autonomy = resolve_autonomy(autonomy_flag)
+    return workflow_name, " ".join(task_parts), backend, permissions, autonomy, keep_worktrees
+
+
+def parse_dashboard_args(args: list[str]) -> tuple[str | None, int] | None:
+    run_id: str | None = None
+    port = 8787
+    idx = 0
+    while idx < len(args):
+        flag = args[idx]
+        idx += 1
+        if flag == "--run-id":
+            if idx >= len(args):
+                return None
+            run_id = args[idx]
+            idx += 1
+            continue
+        if flag == "--port":
+            if idx >= len(args):
+                return None
+            try:
+                port = int(args[idx])
+            except ValueError:
+                return None
+            idx += 1
+            continue
+        return None
+    return run_id, port
+
+
 def build_stage_input(stage: dict[str, Any], task: str, artifacts: dict[str, Any]) -> Any:
     stage_input = stage.get("input")
     if stage_input == "task":
@@ -121,7 +183,7 @@ def build_stage_input(stage: dict[str, Any], task: str, artifacts: dict[str, Any
     return {"task": task, "artifacts": artifacts}
 
 
-def run(
+def run_linear_workflow(
     workflow_name: str,
     task: str,
     backend_name: BackendName,
@@ -134,7 +196,6 @@ def run(
 
     wf = load_workflow(wf_path)
 
-    # load personas used by this workflow
     roles = [stage["role"] for stage in wf.stages]
     persona_texts = {}
     for role in roles:
@@ -149,11 +210,9 @@ def run(
     print(f"Description: {wf.description}")
     print("Stages:", " -> ".join([s["id"] for s in wf.stages]))
     print()
-
     print("== Task ==")
     print(task)
     print()
-
     print("== Personas loaded ==")
     for role in roles:
         print(f"- {role}: {len(persona_texts[role])} chars")
@@ -191,7 +250,6 @@ def run(
 
         backend_error: str | None = None
         stage_output: dict[str, Any] | None = None
-
         try:
             stage_output = backend.run_role(
                 role=role,
@@ -247,7 +305,6 @@ def run(
 
         print(json.dumps(stage_output, indent=2, ensure_ascii=False))
         print()
-
         if backend_error:
             return None, backend_error
         return stage_output, None
@@ -325,7 +382,79 @@ def run(
     return 0
 
 
-def main():
+def run_workflow(
+    workflow_name: str,
+    task: str,
+    backend_name: BackendName,
+    permissions: PermissionMode,
+    autonomy: AutonomyMode,
+    keep_worktrees: bool,
+) -> int:
+    wf_path = REPO_ROOT / "agentkit" / "workflows" / f"{workflow_name}.yaml"
+    if not wf_path.exists():
+        print(f"Workflow not found: {wf_path}")
+        return 1
+    workflow = load_workflow(wf_path)
+    if workflow.kind == "team_orchestrator":
+        orchestrator = TeamOrchestrator(
+            repo_root=REPO_ROOT,
+            workflow_name=workflow_name,
+            workflow=workflow,
+            task=task,
+            backend_name=backend_name,
+            permissions=permissions,
+            autonomy=autonomy,
+            keep_worktrees=keep_worktrees,
+            logs_dir=LOGS_DIR,
+            state_runs_dir=STATE_RUNS_DIR,
+        )
+        return orchestrator.run()
+    return run_linear_workflow(workflow_name, task, backend_name, permissions)
+
+
+def command_runs(args: list[str]) -> int:
+    if not args:
+        print_runs_usage()
+        return 2
+    sub = args[0]
+    if sub == "list":
+        runs = list_runs(STATE_RUNS_DIR)
+        if not runs:
+            print("No runs found.")
+            return 0
+        for run in runs:
+            print(
+                f"{run.get('run_id', '-')}\t{run.get('status', '-')}\t"
+                f"{run.get('workflow', '-')}\t{run.get('created_at', '-')}"
+            )
+        return 0
+    if sub == "show":
+        if len(args) < 2:
+            print_runs_usage()
+            return 2
+        run_id = args[1]
+        try:
+            run = load_run(STATE_RUNS_DIR, run_id)
+        except FileNotFoundError as exc:
+            print(str(exc))
+            return 1
+        print(json.dumps(run, indent=2))
+        return 0
+    print_runs_usage()
+    return 2
+
+
+def command_dashboard(args: list[str]) -> int:
+    parsed = parse_dashboard_args(args)
+    if parsed is None:
+        print_dashboard_usage()
+        return 2
+    run_id, port = parsed
+    run_dashboard(state_root=STATE_RUNS_DIR, run_id=run_id, port=port)
+    return 0
+
+
+def main() -> None:
     if len(sys.argv) >= 2 and sys.argv[1] == "doctor":
         raise SystemExit(doctor())
 
@@ -335,15 +464,40 @@ def main():
             if parsed is None:
                 print_run_usage()
                 raise SystemExit(2)
-            workflow_name, task, backend_name, permissions = parsed
+            workflow_name, task, backend_name, permissions, autonomy, keep_worktrees = parsed
         except ValueError as exc:
             print(str(exc))
             print_run_usage()
             raise SystemExit(2)
-        raise SystemExit(run(workflow_name, task, backend_name, permissions))
+        raise SystemExit(
+            run_workflow(
+                workflow_name,
+                task,
+                backend_name,
+                permissions,
+                autonomy,
+                keep_worktrees,
+            )
+        )
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "runs":
+        raise SystemExit(command_runs(sys.argv[2:]))
+
+    if len(sys.argv) >= 2 and sys.argv[1] == "dashboard":
+        raise SystemExit(command_dashboard(sys.argv[2:]))
 
     print("agentkit is installed.")
     print("Try: agentkit doctor")
+    print("Run linear workflow:")
     print(
-        "Or:  agentkit run pr_factory \"Add a hello endpoint\" --backend stub --permissions read_only"
+        '  agentkit run pr_factory "Add a hello endpoint" --backend stub --permissions read_only'
     )
+    print("Run team workflow:")
+    print(
+        '  agentkit run team_factory_v1 "Build feature X" --backend stub --permissions read_only --autonomy full_auto'
+    )
+    print("List runs:")
+    print("  agentkit runs list")
+    print("Launch dashboard:")
+    print("  agentkit dashboard --run-id <id> --port 8787")
+

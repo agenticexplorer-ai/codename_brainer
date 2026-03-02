@@ -2,4 +2,6 @@ __pycache__/
 *.pyc
 .venv/
 agentkit/logs/
+agentkit/state/
+agentkit/worktrees/
 .DS_Store

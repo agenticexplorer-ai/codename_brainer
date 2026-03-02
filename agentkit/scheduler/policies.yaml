@@ -1,0 +1,18 @@
+run_schema_version: 1
+defaults:
+  autonomy: mixed
+  max_developer_concurrency: 4
+  max_task_retries: 2
+  max_run_duration_seconds: 3600
+  fail_fast_on_backend_errors: true
+scaling:
+  prioritize_roles:
+    - developer
+    - tester
+    - principal_engineer
+    - po
+gates:
+  mixed_mode_mandatory:
+    - scope_lock
+    - integration_start
+    - release_start

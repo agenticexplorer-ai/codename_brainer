@@ -1,0 +1,31 @@
+name: core_v1
+description: "Fixed core team model for AgentKit team-orchestrator V1"
+roles:
+  - role: po
+    default_count: 1
+    min_count: 1
+    max_count: 2
+  - role: principal_engineer
+    default_count: 1
+    min_count: 1
+    max_count: 2
+  - role: developer
+    default_count: 4
+    min_count: 1
+    max_count: 8
+  - role: tester
+    default_count: 1
+    min_count: 1
+    max_count: 3
+  - role: integrator
+    default_count: 1
+    min_count: 1
+    max_count: 2
+  - role: devops
+    default_count: 1
+    min_count: 1
+    max_count: 2
+  - role: cicd
+    default_count: 1
+    min_count: 1
+    max_count: 2

@@ -5,6 +5,152 @@ from pathlib import Path
 from typing import Any
 
 
+def po_stub(payload: dict[str, Any] | str) -> dict[str, Any]:
+    if isinstance(payload, str):
+        return {
+            "problem_statement": payload,
+            "goals": ["convert request into execution-ready scope"],
+            "constraints": ["use minimal change set"],
+            "success_criteria": ["team workflow run completed"],
+        }
+    stage = str(payload.get("stage", "intake"))
+    if stage == "decompose":
+        base_task = str(payload.get("task", "Deliver requested change"))
+        return {
+            "tasks": [
+                {
+                    "id": "T1",
+                    "summary": f"Design approach for: {base_task}",
+                    "acceptance": ["Architecture documented"],
+                    "dependencies": [],
+                },
+                {
+                    "id": "T2",
+                    "summary": f"Implement core code for: {base_task}",
+                    "acceptance": ["Core change implemented"],
+                    "dependencies": ["T1"],
+                },
+                {
+                    "id": "T3",
+                    "summary": "Add tests or validation checks",
+                    "acceptance": ["Validation command list provided"],
+                    "dependencies": ["T2"],
+                },
+                {
+                    "id": "T4",
+                    "summary": "Prepare release notes summary",
+                    "acceptance": ["Release summary draft available"],
+                    "dependencies": ["T2"],
+                },
+            ]
+        }
+    return {
+        "problem_statement": str(payload.get("task", "Unknown task")),
+        "goals": ["build a deliverable implementation plan"],
+        "constraints": ["keep changes reviewable"],
+        "success_criteria": ["workflow completes with approved gates"],
+    }
+
+
+def principal_stub(payload: dict[str, Any]) -> dict[str, Any]:
+    task = str(payload.get("task", "requested change"))
+    return {
+        "architecture_summary": f"Layered implementation for: {task}",
+        "design_decisions": [
+            "Keep workflow deterministic",
+            "Keep outputs as JSON artifacts",
+            "Use isolated task execution context",
+        ],
+        "risks": ["integration ordering", "policy drift"],
+        "implementation_notes": ["validate dependencies before task dispatch"],
+    }
+
+
+def developer_stub(payload: dict[str, Any]) -> dict[str, Any]:
+    task = payload.get("task", {})
+    task_id = str(task.get("id", "T?")) if isinstance(task, dict) else "T?"
+    summary = (
+        str(task.get("summary", "implement task"))
+        if isinstance(task, dict)
+        else "implement task"
+    )
+    worktree = payload.get("worktree", {})
+    branch = str(worktree.get("branch", f"ak/demo/{task_id}")) if isinstance(worktree, dict) else f"ak/demo/{task_id}"
+    path = str(worktree.get("path", f"agentkit/worktrees/demo/{task_id}")) if isinstance(worktree, dict) else f"agentkit/worktrees/demo/{task_id}"
+    return {
+        "task_id": task_id,
+        "changes": [
+            {
+                "path": f"examples/{task_id.lower()}_demo.txt",
+                "type": "create",
+                "summary": f"Simulated implementation for {summary}",
+            }
+        ],
+        "commands_ran": [
+            {
+                "cmd": f"echo '{summary}' > examples/{task_id.lower()}_demo.txt",
+                "exit_code": 0,
+                "notes": "simulated command, not executed",
+            }
+        ],
+        "notes": f"branch={branch} worktree={path}",
+    }
+
+
+def tester_stub(payload: dict[str, Any]) -> dict[str, Any]:
+    stage = str(payload.get("stage", "qa_task"))
+    if stage == "system_qa":
+        return {
+            "verdict": "approve",
+            "findings": [],
+            "recommended_actions": ["system checks look consistent"],
+        }
+    task = payload.get("task", {})
+    task_id = str(task.get("id", "T?")) if isinstance(task, dict) else "T?"
+    return {
+        "verdict": "approve",
+        "findings": [{"severity": "minor", "text": f"{task_id} could add more assertions"}],
+        "recommended_actions": ["proceed to integration"],
+    }
+
+
+def integrator_stub(payload: dict[str, Any]) -> dict[str, Any]:
+    task = payload.get("task", {})
+    task_id = str(task.get("id", "T?")) if isinstance(task, dict) else "T?"
+    queue_position = int(payload.get("queue_position", 1))
+    return {
+        "task_id": task_id,
+        "queue_position": queue_position,
+        "conflict_check": "pass",
+        "merge_decision": "approve",
+        "notes": "merge simulation approved",
+    }
+
+
+def devops_stub(payload: dict[str, Any]) -> dict[str, Any]:
+    integrated = payload.get("integrated", [])
+    count = len(integrated) if isinstance(integrated, list) else 0
+    return {
+        "release_readiness": "ready",
+        "infra_checks": ["local env checks passed"],
+        "rollout_plan": [f"promote integrated queue with {count} task(s)"],
+        "risks": ["manual verification recommended"],
+    }
+
+
+def cicd_stub(payload: dict[str, Any]) -> dict[str, Any]:
+    del payload
+    return {
+        "pipeline_status": "pass",
+        "checks": [
+            {"name": "lint", "status": "pass", "notes": "simulated"},
+            {"name": "tests", "status": "pass", "notes": "simulated"},
+        ],
+        "deployment_recommendation": "proceed",
+        "summary": "local CI simulation succeeded",
+    }
+
+
 def planner_stub(task: str) -> dict[str, Any]:
     # Simple deterministic planner for testing
     return {
@@ -100,6 +246,20 @@ class StubBackend:
 
 
 def _dispatch(role: str, payload: Any) -> dict[str, Any]:
+    if role == "po":
+        return po_stub(payload if isinstance(payload, (dict, str)) else str(payload))
+    if role == "principal_engineer":
+        return principal_stub(payload if isinstance(payload, dict) else {})
+    if role == "developer":
+        return developer_stub(payload if isinstance(payload, dict) else {})
+    if role == "tester":
+        return tester_stub(payload if isinstance(payload, dict) else {})
+    if role == "integrator":
+        return integrator_stub(payload if isinstance(payload, dict) else {})
+    if role == "devops":
+        return devops_stub(payload if isinstance(payload, dict) else {})
+    if role == "cicd":
+        return cicd_stub(payload if isinstance(payload, dict) else {})
     if role == "planner":
         return planner_stub(payload if isinstance(payload, str) else json.dumps(payload))
     if role == "implementer":

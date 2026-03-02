@@ -4,12 +4,18 @@
 
 ## Project layout
 
-- `agentkit/personas/`: role definitions (Planner, Implementer, Reviewer, etc.)
+- `agentkit/personas/`: role definitions (Planner/Implementer/Reviewer and team roles)
 - `agentkit/workflows/`: workflow/state-machine logic
+- `agentkit/team_models/`: team cardinality templates
+- `agentkit/scheduler/`: scheduler and autonomy policies
 - `agentkit/policies/`: command and path safety rules
+- `agentkit/orchestrator/`: team runtime (run store, scheduler, worktrees)
+- `agentkit/dashboard/`: local dashboard server
 - `agentkit/tools/`: wrappers for git, tests, and filesystem operations
 - `agentkit/runner/`: CLI/orchestration runtime
 - `agentkit/logs/`: local run logs (gitignored)
+- `agentkit/state/`: run state store (gitignored)
+- `agentkit/worktrees/`: task worktree sandbox folder (gitignored)
 - `examples/`: demo targets and sample tasks
 
 ## Prerequisites
@@ -73,4 +79,29 @@ agentkit doctor
 agentkit doctor
 ```
 
-If no command is provided, the CLI prints a short help hint.
+Run linear workflow:
+
+```bash
+agentkit run pr_factory "Add a hello endpoint" --backend stub --permissions read_only
+```
+
+Run team workflow:
+
+```bash
+agentkit run team_factory_v1 "Build feature X" --backend stub --permissions read_only --autonomy full_auto
+```
+
+List and inspect team runs:
+
+```bash
+agentkit runs list
+agentkit runs show <run-id>
+```
+
+Launch local dashboard:
+
+```bash
+agentkit dashboard --run-id <run-id> --port 8787
+```
+
+Then open `http://127.0.0.1:8787`.

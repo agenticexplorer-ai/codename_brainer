@@ -1,0 +1,41 @@
+name: team_factory_v1
+description: "Team-oriented orchestrator: PO -> Architecture -> Parallel Dev -> QA -> Integration -> Release"
+kind: team_orchestrator
+team_model: core_v1
+stages:
+  - id: intake
+    role: po
+    input: task
+    output: intake_json
+  - id: architecture
+    role: principal_engineer
+    input: intake_json
+    output: architecture_json
+  - id: decompose
+    role: po
+    input: architecture_json
+    output: tasks_json
+  - id: implement
+    role: developer
+    input: task_item
+    output: implementation_json
+  - id: qa_task
+    role: tester
+    input: implementation_json
+    output: qa_task_json
+  - id: integrate_queue
+    role: integrator
+    input: qa_task_json
+    output: integration_json
+  - id: system_qa
+    role: tester
+    input: integrated_summary_json
+    output: system_qa_json
+  - id: release_plan
+    role: devops
+    input: integrated_summary_json
+    output: release_plan_json
+  - id: cicd_simulation
+    role: cicd
+    input: release_plan_json
+    output: cicd_json
