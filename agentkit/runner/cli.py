@@ -1,10 +1,15 @@
 import shutil
 import sys
+import json
+from datetime import datetime
 from pathlib import Path
 
+from agentkit.backends import stub as stub_backend
 from agentkit.runner.loaders import load_text, load_workflow
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+LOGS_DIR = REPO_ROOT / "agentkit" / "logs"
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def doctor() -> int:
@@ -59,8 +64,56 @@ def run(workflow_name: str, task: str) -> int:
     print("== Personas loaded ==")
     for role in roles:
         print(f"- {role}: {len(persona_texts[role])} chars")
+    print()
 
-    print("\n✅ Runner wiring OK (no agent execution yet).")
+    # run the pipeline with the stub backend
+    context = {"task": task}
+    artifacts = {}
+    run_stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    run_log_file = LOGS_DIR / f"run_{workflow_name}_{run_stamp}.jsonl"
+
+    for stage in wf.stages:
+        stage_id = stage["id"]
+        role = stage["role"]
+        print(f"--- Stage: {stage_id} (role: {role}) ---")
+
+        # choose input for the role
+        if stage.get("input") == "task":
+            role_input = task
+        elif stage.get("input") == "plan_json":
+            role_input = artifacts.get("plan")
+        elif stage.get("input") == "impl_report_json":
+            role_input = artifacts.get("implement")
+        else:
+            # generic fallback: pass the whole context
+            role_input = context
+
+        # call stub backend (replace this later with CodexBackend)
+        try:
+            out = stub_backend.run_role(role, role_input)
+        except Exception as e:
+            print(f"Error running role '{role}': {e}")
+            return 1
+
+        # store artifact keyed by stage id for later stages
+        artifacts[stage_id] = out
+
+        # log to file (one JSON line per stage)
+        log_entry = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "stage": stage_id,
+            "role": role,
+            "input_preview": str(role_input)[:100],
+            "output": out,
+        }
+        with open(run_log_file, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+
+        # pretty print the output
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+        print()
+
+    print(f"✅ Run complete. Logs: {run_log_file}")
     return 0
 
 

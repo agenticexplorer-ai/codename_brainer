@@ -7,6 +7,8 @@ agentkit.egg-info/dependency_links.txt
 agentkit.egg-info/entry_points.txt
 agentkit.egg-info/requires.txt
 agentkit.egg-info/top_level.txt
+agentkit/backends/__init__.py
+agentkit/backends/stub.py
 agentkit/runner/__init__.py
 agentkit/runner/cli.py
 agentkit/runner/loaders.py
