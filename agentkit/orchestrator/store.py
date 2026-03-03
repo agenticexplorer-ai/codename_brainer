@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from agentkit.orchestrator.types import RunState, TaskItem
+
+TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 
 def utc_now_iso() -> str:
@@ -173,3 +176,82 @@ def append_chat_message(
         raise FileNotFoundError(f"Run not found: {run_id}")
     store = RunStore(state_root, run_id)
     store.write_chat(role=role, content=content, kind=kind, meta=meta)
+
+
+def delete_run(state_root: Path, run_id: str) -> bool:
+    run_dir = state_root / run_id
+    if not run_dir.exists():
+        return False
+    if not run_dir.is_dir():
+        raise RuntimeError(f"Run path is not a directory: {run_dir}")
+    shutil.rmtree(run_dir)
+    return True
+
+
+def force_cancel_run(
+    state_root: Path,
+    run_id: str,
+    *,
+    reason: str = "manual_force_cancel",
+) -> dict[str, Any]:
+    run = load_run(state_root, run_id)
+    status = str(run.get("status", "")).strip()
+    if status == "cancelled":
+        return run
+    if status in TERMINAL_STATUSES:
+        return run
+
+    now = utc_now_iso()
+    metadata = run.get("metadata")
+    metadata_obj = metadata if isinstance(metadata, dict) else {}
+    metadata_obj["forced_cancel"] = True
+    metadata_obj["forced_cancel_reason"] = reason
+    metadata_obj["forced_cancel_at"] = now
+    run["metadata"] = metadata_obj
+    run["status"] = "cancelled"
+    run["updated_at"] = now
+
+    store = RunStore(state_root, run_id)
+    store.run_file.write_text(json.dumps(run, indent=2), encoding="utf-8")
+    store.write_event(
+        role="system",
+        stage="run",
+        state="cancelled",
+        details={"source": reason, "forced": True},
+    )
+    store.write_chat(
+        role="system",
+        kind="summary",
+        content=f"Run {run_id} cancelled ({reason}).",
+        meta={"status": "cancelled", "forced": True, "source": reason},
+    )
+    return run
+
+
+def prune_runs(
+    state_root: Path,
+    *,
+    statuses: set[str] | None = None,
+) -> dict[str, Any]:
+    targets = statuses or {"completed", "failed", "cancelled"}
+    removed: list[str] = []
+    skipped: list[dict[str, str]] = []
+    for run in list_runs(state_root):
+        run_id = str(run.get("run_id", "")).strip()
+        status = str(run.get("status", "")).strip()
+        if not run_id:
+            continue
+        if status not in targets:
+            continue
+        try:
+            if delete_run(state_root, run_id):
+                removed.append(run_id)
+            else:
+                skipped.append({"run_id": run_id, "reason": "not_found"})
+        except Exception as exc:
+            skipped.append({"run_id": run_id, "reason": str(exc)})
+    return {
+        "removed": removed,
+        "skipped": skipped,
+        "target_statuses": sorted(targets),
+    }

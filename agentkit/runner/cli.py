@@ -11,7 +11,13 @@ from typing import Any
 from agentkit.backends import build_backend
 from agentkit.backends.base import BackendName, PermissionMode
 from agentkit.dashboard.server import run_dashboard
-from agentkit.orchestrator.store import list_runs, load_run
+from agentkit.orchestrator.store import (
+    delete_run,
+    force_cancel_run,
+    list_runs,
+    load_run,
+    prune_runs,
+)
 from agentkit.orchestrator.team_runner import TeamOrchestrator
 from agentkit.orchestrator.types import AutonomyMode
 from agentkit.policies.checks import evaluate_implementer_report, load_policy_lines
@@ -64,7 +70,11 @@ def print_dashboard_usage() -> None:
 
 
 def print_runs_usage() -> None:
-    print("Usage: agentkit runs list | agentkit runs show <run-id>")
+    print(
+        "Usage: agentkit runs list | agentkit runs show <run-id> "
+        "| agentkit runs stop <run-id> [--force] "
+        "| agentkit runs delete <run-id> [--force] | agentkit runs prune"
+    )
 
 
 def resolve_backend_name(backend_flag: str | None) -> BackendName:
@@ -440,6 +450,72 @@ def command_runs(args: list[str]) -> int:
             return 1
         print(json.dumps(run, indent=2))
         return 0
+    if sub == "delete":
+        if len(args) < 2:
+            print_runs_usage()
+            return 2
+        run_id = args[1]
+        force = len(args) >= 3 and args[2] == "--force"
+        try:
+            run = load_run(STATE_RUNS_DIR, run_id)
+        except FileNotFoundError as exc:
+            print(str(exc))
+            return 1
+        status = str(run.get("status", "")).strip()
+        if status in {"running", "paused"} and not force:
+            print(
+                f"Run '{run_id}' is {status}. "
+                "Use: agentkit runs delete <run-id> --force"
+            )
+            return 1
+        try:
+            if force:
+                force_cancel_run(
+                    STATE_RUNS_DIR,
+                    run_id,
+                    reason="cli_delete_force",
+                )
+            deleted = delete_run(STATE_RUNS_DIR, run_id)
+        except Exception as exc:
+            print(f"Could not delete run '{run_id}': {exc}")
+            return 1
+        if not deleted:
+            print(f"Run not found: {run_id}")
+            return 1
+        print(f"Deleted run: {run_id}")
+        return 0
+    if sub == "stop":
+        if len(args) < 2:
+            print_runs_usage()
+            return 2
+        run_id = args[1]
+        force = len(args) >= 3 and args[2] == "--force"
+        try:
+            run = load_run(STATE_RUNS_DIR, run_id)
+        except FileNotFoundError as exc:
+            print(str(exc))
+            return 1
+        status = str(run.get("status", "")).strip()
+        if status in {"completed", "failed", "cancelled"}:
+            print(f"Run '{run_id}' already {status}.")
+            return 0
+        if status in {"running", "paused"} and not force:
+            print(f"Run '{run_id}' is {status}. Use: agentkit runs stop <run-id> --force")
+            return 1
+        updated = force_cancel_run(
+            STATE_RUNS_DIR,
+            run_id,
+            reason="cli_stop_force" if force else "cli_stop",
+        )
+        print(f"Stopped run: {run_id} (status={updated.get('status', 'cancelled')})")
+        return 0
+    if sub == "prune":
+        result = prune_runs(STATE_RUNS_DIR, statuses={"completed", "failed", "cancelled"})
+        print(
+            f"Pruned runs: {len(result.get('removed', []))} removed, "
+            f"{len(result.get('skipped', []))} skipped."
+        )
+        return 0
     print_runs_usage()
     return 2
 
@@ -498,5 +574,11 @@ def main() -> None:
     )
     print("List runs:")
     print("  agentkit runs list")
+    print("Delete one run:")
+    print("  agentkit runs delete <run-id>")
+    print("Stop one run:")
+    print("  agentkit runs stop <run-id> --force")
+    print("Prune completed runs:")
+    print("  agentkit runs prune")
     print("Launch dashboard:")
     print("  agentkit dashboard --port 8787")

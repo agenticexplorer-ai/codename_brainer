@@ -96,6 +96,10 @@ List and inspect team runs:
 ```bash
 agentkit runs list
 agentkit runs show <run-id>
+agentkit runs stop <run-id> --force
+agentkit runs delete <run-id>
+agentkit runs delete <run-id> --force
+agentkit runs prune
 ```
 
 Launch local dashboard:
@@ -116,5 +120,6 @@ Then open `http://127.0.0.1:8787`.
    - `Approve` / `Reject` for gate checks.
    - `Continue` for `step_major` pacing checkpoints.
 6. Use `Send Note` to append a message to the current running run.
+7. Use `Force Stop`, `Delete Selected Run`, or `Prune Completed Runs` from the right panel to clean history.
 
 You can still switch runs from the run dropdown, and CLI-driven runs remain supported.

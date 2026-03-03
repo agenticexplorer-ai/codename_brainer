@@ -14,8 +14,11 @@ from urllib.parse import urlparse
 
 from agentkit.orchestrator.store import (
     append_chat_message,
+    delete_run as delete_run_dir,
+    force_cancel_run,
     list_runs,
     load_run,
+    prune_runs,
     read_jsonl,
     utc_now_iso,
 )
@@ -59,6 +62,16 @@ class DashboardRuntime:
         self._lock = threading.Lock()
         self._active_run_id = default_run_id
         self._jobs: dict[str, threading.Thread] = {}
+
+    def _job_is_alive(self, run_id: str) -> bool:
+        with self._lock:
+            thread = self._jobs.get(run_id)
+            if thread is None:
+                return False
+            if thread.is_alive():
+                return True
+            self._jobs.pop(run_id, None)
+            return False
 
     def start_chat_run(self, payload: dict[str, Any]) -> dict[str, Any]:
         message = str(payload.get("message", "")).strip()
@@ -193,6 +206,83 @@ class DashboardRuntime:
         with (run_dir / "actions.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
         return {"ok": True, "action": action, "run_id": run_id}
+
+    def stop_run(self, run_id: str, *, force: bool = False) -> dict[str, Any]:
+        run = load_run(self.state_root, run_id)
+        status = str(run.get("status", "")).strip()
+        if status in {"completed", "failed", "cancelled"}:
+            return {"ok": True, "run_id": run_id, "status": status}
+
+        self.append_action(run_id, "cancel", meta={"source": "dashboard_stop"})
+        thread_alive = self._job_is_alive(run_id)
+
+        if thread_alive and not force:
+            return {
+                "ok": True,
+                "run_id": run_id,
+                "status": "cancel_requested",
+                "forced": False,
+            }
+
+        updated = force_cancel_run(
+            self.state_root,
+            run_id,
+            reason="dashboard_force_stop",
+        )
+        with self._lock:
+            self._jobs.pop(run_id, None)
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "status": str(updated.get("status", "cancelled")),
+            "forced": True,
+        }
+
+    def control_action(self, run_id: str, action: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        run = load_run(self.state_root, run_id)
+        status = str(run.get("status", "")).strip()
+        if status in {"completed", "failed", "cancelled"}:
+            return {"ok": True, "run_id": run_id, "status": status, "action": action}
+
+        if action == "cancel":
+            return self.stop_run(run_id, force=False)
+
+        if action in {"pause", "resume"} and not self._job_is_alive(run_id):
+            raise RuntimeError(
+                f"Run '{run_id}' is not currently executing in this dashboard session. "
+                "Use Force Stop to terminate stale running state."
+            )
+
+        return self.append_action(run_id, action, meta=meta)
+
+    def delete_run(self, run_id: str, *, force: bool = False) -> dict[str, Any]:
+        run = load_run(self.state_root, run_id)
+        status = str(run.get("status", "")).strip()
+        if status in {"running", "paused"}:
+            if not force:
+                raise RuntimeError(
+                    f"Cannot delete run '{run_id}' while status is '{status}'. "
+                    "Force stop first."
+                )
+            self.stop_run(run_id, force=True)
+        deleted = delete_run_dir(self.state_root, run_id)
+        if not deleted:
+            raise FileNotFoundError(f"Run not found: {run_id}")
+        with self._lock:
+            if self._active_run_id == run_id:
+                self._active_run_id = None
+            self._jobs.pop(run_id, None)
+        return {"ok": True, "deleted_run_id": run_id, "forced": force}
+
+    def prune_runs(self) -> dict[str, Any]:
+        result = prune_runs(self.state_root, statuses={"completed", "failed", "cancelled"})
+        removed_ids = set(result.get("removed", []))
+        with self._lock:
+            if self._active_run_id in removed_ids:
+                self._active_run_id = None
+            for run_id in removed_ids:
+                self._jobs.pop(run_id, None)
+        return {"ok": True, **result}
 
     def resolve_active_run(self) -> dict[str, Any] | None:
         runs = list_runs(self.state_root)
@@ -352,6 +442,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(out)
             return
 
+        if path == "/api/runs/actions/prune":
+            _body = self._read_json_body(allow_empty=True)
+            if _body is None:
+                return
+            out = self.runtime.prune_runs()
+            self._send_json(out)
+            return
+
+        if path.startswith("/api/runs/") and path.endswith("/actions/stop"):
+            run_id = path.split("/")[3]
+            body = self._read_json_body(allow_empty=True)
+            if body is None:
+                return
+            meta = body.get("meta") if isinstance(body, dict) else {}
+            force = bool(meta.get("force")) if isinstance(meta, dict) else False
+            try:
+                out = self.runtime.stop_run(run_id, force=force)
+            except FileNotFoundError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=404)
+                return
+            self._send_json(out)
+            return
+
         if not path.startswith("/api/runs/") or "/actions/" not in path:
             self.send_error(HTTPStatus.NOT_FOUND, "Not found")
             return
@@ -362,17 +475,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         run_id = parts[3]
         action = parts[5]
-        if action not in {"pause", "resume", "cancel", "approve", "reject", "continue"}:
+        if action not in {"pause", "resume", "cancel", "approve", "reject", "continue", "delete"}:
             self.send_error(HTTPStatus.BAD_REQUEST, "Unsupported action")
+            return
+
+        if action == "delete":
+            body = self._read_json_body(allow_empty=True)
+            if body is None:
+                return
+            meta = body.get("meta") if isinstance(body, dict) else {}
+            force = bool(meta.get("force")) if isinstance(meta, dict) else False
+            try:
+                out = self.runtime.delete_run(run_id, force=force)
+            except FileNotFoundError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=404)
+                return
+            except RuntimeError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=409)
+                return
+            self._send_json(out)
             return
 
         body = self._read_json_body(allow_empty=True)
         if body is None:
             return
         try:
-            out = self.runtime.append_action(run_id, action, meta=body.get("meta") if isinstance(body, dict) else None)
+            out = self.runtime.control_action(
+                run_id,
+                action,
+                meta=body.get("meta") if isinstance(body, dict) else None,
+            )
         except FileNotFoundError as exc:
             self._send_json({"ok": False, "error": str(exc)}, status=404)
+            return
+        except RuntimeError as exc:
+            self._send_json({"ok": False, "error": str(exc)}, status=409)
             return
         self._send_json(out)
 
@@ -433,9 +570,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         offset += 1
                         if not raw:
                             continue
-                        self.wfile.write(f"data: {raw}\\n\\n".encode("utf-8"))
+                        self.wfile.write(f"data: {raw}\n\n".encode("utf-8"))
                         self.wfile.flush()
-                self.wfile.write(b": ping\\n\\n")
+                self.wfile.write(b": ping\n\n")
                 self.wfile.flush()
                 time.sleep(1.0)
         except (ConnectionError, BrokenPipeError):
@@ -833,6 +970,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
           <button id=\"resumeBtn\">Resume</button>
           <button id=\"continueBtn\" class=\"info\">Continue</button>
           <button id=\"cancelBtn\" class=\"bad\">Cancel</button>
+          <button id=\"stopBtn\" class=\"bad\">Force Stop</button>
+        </div>
+        <div class=\"controls\">
+          <button id=\"deleteRunBtn\" class=\"bad\">Delete Selected Run</button>
+          <button id=\"pruneRunsBtn\" class=\"ghost\">Prune Completed Runs</button>
         </div>
         <div style=\"margin-top:8px;\">
           <label>Run switcher
@@ -933,6 +1075,7 @@ function updateControls() {
   const status = activeRun ? String(activeRun.status || "") : "";
   const running = status === "running";
   const paused = status === "paused";
+  const deletable = Boolean(activeRunId);
   const uiState = activeRun && activeRun.ui_state ? activeRun.ui_state : {};
   const stepWaiting = Boolean(uiState && uiState.step_waiting);
 
@@ -941,12 +1084,18 @@ function updateControls() {
   const resumeBtn = document.getElementById("resumeBtn");
   const continueBtn = document.getElementById("continueBtn");
   const cancelBtn = document.getElementById("cancelBtn");
+  const stopBtn = document.getElementById("stopBtn");
+  const deleteRunBtn = document.getElementById("deleteRunBtn");
+  const pruneRunsBtn = document.getElementById("pruneRunsBtn");
 
   noteBtn.disabled = !running;
   pauseBtn.disabled = !running;
   resumeBtn.disabled = !paused;
   continueBtn.disabled = !(running && stepWaiting);
   cancelBtn.disabled = !(running || paused);
+  stopBtn.disabled = !(running || paused);
+  deleteRunBtn.disabled = !deletable;
+  pruneRunsBtn.disabled = false;
 }
 
 function renderNowWorking() {
@@ -1318,17 +1467,20 @@ function scheduleRefresh() {
     try {
       await loadRun(activeRunId);
     } catch {
-      // keep current screen
+      await loadActiveRun();
     }
   }, 350);
 }
 
-async function loadRun(runId) {
+async function loadRun(runId, options = {}) {
+  const refreshRuns = Boolean(options.refreshRuns);
   const run = await api(`/api/runs/${runId}`);
   activeRun = run;
   activeRunId = run.run_id || runId;
   renderAll();
-  await refreshRunsDropdown();
+  if (refreshRuns) {
+    await refreshRunsDropdown();
+  }
   subscribeEvents(activeRunId);
 }
 
@@ -1373,7 +1525,7 @@ async function startNewChat() {
       body: JSON.stringify(payload),
     });
     input.value = "";
-    await loadRun(started.run_id);
+    await loadRun(started.run_id, { refreshRuns: true });
     setStatus("run started");
   } catch (err) {
     setError(err.message || String(err));
@@ -1440,6 +1592,87 @@ async function sendAction(action, meta = {}, cardKey = null) {
   }
 }
 
+async function deleteSelectedRun() {
+  setError("");
+  if (!activeRunId) {
+    setError("No run selected.");
+    return;
+  }
+  const runStatus = activeRun ? String(activeRun.status || "") : "";
+  let force = false;
+  if (["running", "paused"].includes(runStatus)) {
+    force = true;
+    if (!confirm(`Run ${activeRunId} is ${runStatus}. Force stop and delete it?`)) {
+      return;
+    }
+  } else if (!confirm(`Delete run ${activeRunId}? This cannot be undone.`)) {
+    return;
+  }
+  try {
+    setStatus("deleting run...");
+    await api(`/api/runs/${activeRunId}/actions/delete`, {
+      method: "POST",
+      body: JSON.stringify({ meta: { force } }),
+    });
+    activeRun = null;
+    activeRunId = null;
+    pendingCardActions = new Map();
+    await loadActiveRun();
+    setStatus("run deleted");
+  } catch (err) {
+    setError(err.message || String(err));
+    setStatus("");
+  }
+}
+
+async function forceStopRun() {
+  setError("");
+  if (!activeRunId) {
+    setError("No run selected.");
+    return;
+  }
+  if (!activeRun || !["running", "paused"].includes(String(activeRun.status || ""))) {
+    setStatus("run is not active");
+    return;
+  }
+  if (!confirm(`Force stop run ${activeRunId}?`)) {
+    return;
+  }
+  try {
+    setStatus("stopping run...");
+    await api(`/api/runs/${activeRunId}/actions/stop`, {
+      method: "POST",
+      body: JSON.stringify({ meta: { force: true } }),
+    });
+    await loadRun(activeRunId);
+    setStatus("run stopped");
+  } catch (err) {
+    setError(err.message || String(err));
+    setStatus("");
+  }
+}
+
+async function pruneCompletedRuns() {
+  setError("");
+  if (!confirm("Delete all completed/failed/cancelled runs?")) {
+    return;
+  }
+  try {
+    setStatus("pruning runs...");
+    const out = await api("/api/runs/actions/prune", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+    await loadActiveRun();
+    const removed = Array.isArray(out.removed) ? out.removed.length : 0;
+    const skipped = Array.isArray(out.skipped) ? out.skipped.length : 0;
+    setStatus(`pruned ${removed} run(s), skipped ${skipped}`);
+  } catch (err) {
+    setError(err.message || String(err));
+    setStatus("");
+  }
+}
+
 document.getElementById("newChatBtn").addEventListener("click", startNewChat);
 document.getElementById("newChatTopBtn").addEventListener("click", startNewChat);
 document.getElementById("noteBtn").addEventListener("click", sendNote);
@@ -1447,6 +1680,9 @@ document.getElementById("pauseBtn").addEventListener("click", () => sendAction("
 document.getElementById("resumeBtn").addEventListener("click", () => sendAction("resume"));
 document.getElementById("continueBtn").addEventListener("click", () => sendAction("continue"));
 document.getElementById("cancelBtn").addEventListener("click", () => sendAction("cancel"));
+document.getElementById("stopBtn").addEventListener("click", forceStopRun);
+document.getElementById("deleteRunBtn").addEventListener("click", deleteSelectedRun);
+document.getElementById("pruneRunsBtn").addEventListener("click", pruneCompletedRuns);
 document.getElementById("runSwitch").addEventListener("change", async (ev) => {
   const runId = ev.target.value;
   if (!runId) return;
