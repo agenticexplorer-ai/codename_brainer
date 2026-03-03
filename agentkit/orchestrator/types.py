@@ -6,6 +6,7 @@ from typing import Any, Literal
 from agentkit.backends.base import BackendName, PermissionMode
 
 AutonomyMode = Literal["full_auto", "mixed", "human_in_loop"]
+PacingMode = Literal["realtime", "step_major"]
 TaskStatus = Literal[
     "queued",
     "in_progress",
@@ -72,4 +73,3 @@ class RunState:
     created_at: str
     updated_at: str
     metadata: dict[str, Any] = field(default_factory=dict)
-

@@ -15,9 +15,21 @@ from agentkit.backends import build_backend
 from agentkit.backends.base import BackendName, PermissionMode
 from agentkit.orchestrator.config import load_role_pool, load_scheduler_policies
 from agentkit.orchestrator.store import RunStore, utc_now_iso
-from agentkit.orchestrator.types import AutonomyMode, RunState, TaskItem
+from agentkit.orchestrator.types import AutonomyMode, PacingMode, RunState, TaskItem
 from agentkit.orchestrator.worktree import WorktreeManager
 from agentkit.runner.loaders import Workflow, load_text
+
+MAJOR_STAGE_ORDER = [
+    "intake",
+    "architecture",
+    "decompose",
+    "implement_batch",
+    "integrate_queue",
+    "system_qa",
+    "release_plan",
+    "cicd_simulation",
+]
+MAJOR_GATES = {"scope_lock", "integration_start", "release_start"}
 
 
 class TeamOrchestrator:
@@ -34,6 +46,7 @@ class TeamOrchestrator:
         keep_worktrees: bool,
         logs_dir: Path,
         state_runs_dir: Path,
+        pacing_mode: PacingMode = "realtime",
         interactive_gates: bool = True,
     ) -> None:
         self.repo_root = repo_root
@@ -43,6 +56,7 @@ class TeamOrchestrator:
         self.backend_name = backend_name
         self.permissions = permissions
         self.autonomy = autonomy
+        self.pacing_mode = pacing_mode
         self.keep_worktrees = keep_worktrees
         self.interactive_gates = interactive_gates
         self.logs_dir = logs_dir
@@ -92,19 +106,26 @@ class TeamOrchestrator:
         self.cancel_requested = False
 
     def run(self) -> int:
-        run_state = RunState(
-            run_id=self.run_id,
-            workflow=self.workflow_name,
-            task=self.task,
-            autonomy=self.autonomy,
-            backend=self.backend_name,
-            permissions=self.permissions,
-            status="running",
-            team_model=self.team_model_name,
-            created_at=utc_now_iso(),
-            updated_at=utc_now_iso(),
-            metadata={"kind": "team_orchestrator"},
-        )
+        if self.run_state is not None:
+            run_state = self.run_state
+            run_state.status = "running"
+            run_state.updated_at = utc_now_iso()
+            run_state.metadata["kind"] = "team_orchestrator"
+            run_state.metadata["pacing_mode"] = self.pacing_mode
+        else:
+            run_state = RunState(
+                run_id=self.run_id,
+                workflow=self.workflow_name,
+                task=self.task,
+                autonomy=self.autonomy,
+                backend=self.backend_name,
+                permissions=self.permissions,
+                status="running",
+                team_model=self.team_model_name,
+                created_at=utc_now_iso(),
+                updated_at=utc_now_iso(),
+                metadata={"kind": "team_orchestrator", "pacing_mode": self.pacing_mode},
+            )
         self.run_state = run_state
         self.run_store.write_run(run_state)
 
@@ -114,6 +135,7 @@ class TeamOrchestrator:
             print(f"Run ID: {self.run_id}")
             print(f"Name: {self.workflow.name}")
             print(f"Autonomy: {self.autonomy}")
+            print(f"Pacing: {self.pacing_mode}")
             print(f"Backend: {self.backend_name}")
             print()
 
@@ -123,6 +145,7 @@ class TeamOrchestrator:
                 input_payload={"stage": "intake", "task": self.task},
                 artifact_name="intake",
             )
+            self._maybe_wait_for_step(checkpoint="intake", next_stage="architecture")
             architecture = self._run_stage(
                 stage_id="architecture",
                 role="principal_engineer",
@@ -133,6 +156,7 @@ class TeamOrchestrator:
                 },
                 artifact_name="architecture",
             )
+            self._maybe_wait_for_step(checkpoint="architecture", next_stage="decompose")
             decompose = self._run_stage(
                 stage_id="decompose",
                 role="po",
@@ -153,11 +177,13 @@ class TeamOrchestrator:
                 raise RuntimeError("scope lock gate not approved")
 
             task_results = self._run_developer_and_task_qa(tasks, architecture)
+            self._maybe_wait_for_step(checkpoint="implement_batch", next_stage="integration_start")
 
             if not self._gate("integration_start", requested_by="integrator", details={"ready_tasks": len(task_results)}):
                 raise RuntimeError("integration start gate not approved")
 
             integrated = self._run_integration_queue(task_results)
+            self._maybe_wait_for_step(checkpoint="integrate_queue", next_stage="system_qa")
             self._run_stage(
                 stage_id="system_qa",
                 role="tester",
@@ -165,12 +191,14 @@ class TeamOrchestrator:
                 artifact_name="system_qa",
                 require_approve=self.permissions != "read_only",
             )
+            self._maybe_wait_for_step(checkpoint="system_qa", next_stage="release_plan")
             release_plan = self._run_stage(
                 stage_id="release_plan",
                 role="devops",
                 input_payload={"stage": "release_plan", "integrated": integrated},
                 artifact_name="release_plan",
             )
+            self._maybe_wait_for_step(checkpoint="release_plan", next_stage="release_start")
 
             if not self._gate("release_start", requested_by="cicd", details={"integrated_tasks": len(integrated)}):
                 raise RuntimeError("release start gate not approved")
@@ -572,6 +600,49 @@ class TeamOrchestrator:
                     self.role_thread_ids[role] = thread_id
             return out if isinstance(out, dict) else {"error": "backend returned non-dict output"}
 
+    def _maybe_wait_for_step(self, *, checkpoint: str, next_stage: str) -> None:
+        if self.pacing_mode != "step_major":
+            return
+        if checkpoint not in MAJOR_STAGE_ORDER:
+            return
+        if next_stage in MAJOR_GATES:
+            return
+        self._event(
+            "system",
+            checkpoint,
+            "step_waiting",
+            details={"checkpoint": checkpoint, "next_stage": next_stage},
+        )
+        self._wait_for_continue(checkpoint=checkpoint, next_stage=next_stage)
+        self._event(
+            "system",
+            checkpoint,
+            "step_continued",
+            details={"checkpoint": checkpoint, "next_stage": next_stage},
+        )
+
+    def _wait_for_continue(self, *, checkpoint: str, next_stage: str) -> None:
+        if self.interactive_gates and sys.stdin.isatty():
+            try:
+                answer = input(
+                    f"Step wait after {checkpoint}. Continue to {next_stage}? [y/N]: "
+                ).strip().lower()
+            except EOFError:
+                answer = "n"
+            if answer in {"y", "yes", "c", "continue"}:
+                return
+            raise RuntimeError(f"step wait rejected at checkpoint {checkpoint}")
+
+        while True:
+            self._sync_control_actions(wait_if_paused=True)
+            for action in self._drain_pending_actions():
+                action_name = str(action.get("action", "")).lower()
+                if action_name == "continue":
+                    return
+                if action_name == "cancel":
+                    raise RuntimeError("run cancelled by user")
+            time.sleep(0.5)
+
     def _gate(self, gate: str, *, requested_by: str, details: dict[str, Any]) -> bool:
         self._sync_control_actions(wait_if_paused=True)
         requires_prompt = False
@@ -748,6 +819,18 @@ class TeamOrchestrator:
             return "message", f"Gate {stage} {verdict}."
         if state == "gate_waiting":
             return "approval", f"Waiting for approval on gate {stage}."
+        if state == "step_waiting":
+            target = ""
+            if isinstance(details, dict):
+                target = str(details.get("next_stage", "")).strip()
+            msg = (
+                f"Waiting for Continue: {target}"
+                if target
+                else f"Waiting for Continue after {stage}"
+            )
+            return "step_wait", msg
+        if state == "step_continued":
+            return "message", f"Continued from {stage}."
         if details and "message" in details:
             return "message", str(details["message"])
         return "message", f"{role} {state} at {stage}."

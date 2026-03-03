@@ -110,8 +110,11 @@ Then open `http://127.0.0.1:8787`.
 
 1. Open the dashboard.
 2. Type your request in the chat box.
-3. Press `Send` to start a run (defaults: `team_factory_v1`, `stub`, `read_only`, `mixed`).
+3. Press `Start New Chat` to start a fresh run (defaults: `team_factory_v1`, `stub`, `read_only`, `mixed`, `realtime` pacing).
 4. Watch live persona/stage/task/worktree updates in the right-side panels.
-5. Approve or reject gate cards inline in chat when they appear.
+5. Use inline cards in chat:
+   - `Approve` / `Reject` for gate checks.
+   - `Continue` for `step_major` pacing checkpoints.
+6. Use `Send Note` to append a message to the current running run.
 
 You can still switch runs from the run dropdown, and CLI-driven runs remain supported.

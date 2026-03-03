@@ -26,6 +26,7 @@ from agentkit.runner.loaders import load_workflow
 VALID_BACKENDS: set[str] = {"stub", "codex"}
 VALID_PERMISSIONS: set[str] = {"read_only", "write_safe"}
 VALID_AUTONOMY: set[str] = {"full_auto", "mixed", "human_in_loop"}
+VALID_PACING: set[str] = {"realtime", "step_major"}
 
 
 class QuietThreadingHTTPServer(ThreadingHTTPServer):
@@ -68,6 +69,7 @@ class DashboardRuntime:
         backend = str(payload.get("backend", "stub")).strip() or "stub"
         permissions = str(payload.get("permissions", "read_only")).strip() or "read_only"
         autonomy = str(payload.get("autonomy", "mixed")).strip() or "mixed"
+        pacing_mode = str(payload.get("pacing_mode", "realtime")).strip() or "realtime"
         keep_worktrees = bool(payload.get("keep_worktrees", False))
 
         if backend not in VALID_BACKENDS:
@@ -76,6 +78,8 @@ class DashboardRuntime:
             raise ValueError(f"Invalid permissions: {permissions}")
         if autonomy not in VALID_AUTONOMY:
             raise ValueError(f"Invalid autonomy: {autonomy}")
+        if pacing_mode not in VALID_PACING:
+            raise ValueError(f"Invalid pacing_mode: {pacing_mode}")
 
         wf_path = self.repo_root / "agentkit" / "workflows" / f"{workflow_name}.yaml"
         if not wf_path.exists():
@@ -95,6 +99,7 @@ class DashboardRuntime:
             backend_name=backend,  # type: ignore[arg-type]
             permissions=permissions,  # type: ignore[arg-type]
             autonomy=autonomy,  # type: ignore[arg-type]
+            pacing_mode=pacing_mode,  # type: ignore[arg-type]
             keep_worktrees=keep_worktrees,
             logs_dir=self.logs_dir,
             state_runs_dir=self.state_root,
@@ -114,7 +119,11 @@ class DashboardRuntime:
             team_model=orchestrator.team_model_name,
             created_at=now,
             updated_at=now,
-            metadata={"kind": "team_orchestrator", "source": "dashboard_chat"},
+            metadata={
+                "kind": "team_orchestrator",
+                "source": "dashboard_chat",
+                "pacing_mode": pacing_mode,
+            },
         )
         orchestrator.run_state = run_state
         orchestrator.run_store.write_run(run_state)
@@ -129,13 +138,15 @@ class DashboardRuntime:
             kind="message",
             content=(
                 f"Run {run_id} started with workflow={workflow_name}, "
-                f"backend={backend}, permissions={permissions}, autonomy={autonomy}."
+                f"backend={backend}, permissions={permissions}, autonomy={autonomy}, "
+                f"pacing_mode={pacing_mode}."
             ),
             meta={
                 "workflow": workflow_name,
                 "backend": backend,
                 "permissions": permissions,
                 "autonomy": autonomy,
+                "pacing_mode": pacing_mode,
             },
         )
 
@@ -221,11 +232,53 @@ class DashboardRuntime:
     def run_payload(self, run_id: str) -> dict[str, Any]:
         run = load_run(self.state_root, run_id)
         run_dir = self.state_root / run_id
-        run["events"] = read_jsonl(run_dir / "events.jsonl")
+        events = read_jsonl(run_dir / "events.jsonl")
+        run["events"] = events
         run["tasks"] = read_jsonl(run_dir / "tasks.jsonl")
         run["worktrees"] = read_jsonl(run_dir / "worktrees.jsonl")
         run["chat"] = read_jsonl(run_dir / "chat.jsonl")
+        run["ui_state"] = self._derive_ui_state(events, run)
         return run
+
+    def _derive_ui_state(self, events: list[dict[str, Any]], run: dict[str, Any]) -> dict[str, Any]:
+        pending_gate: str | None = None
+        step_waiting = False
+        next_stage: str | None = None
+
+        for event in events:
+            stage = str(event.get("stage", "")).strip()
+            state = str(event.get("state", "")).strip()
+            details = event.get("details", {})
+            details_obj = details if isinstance(details, dict) else {}
+
+            if state in {"gate_requested", "gate_waiting"} and stage:
+                pending_gate = stage
+            elif state in {"gate_approved", "gate_rejected"} and stage and pending_gate == stage:
+                pending_gate = None
+
+            if state == "step_waiting":
+                step_waiting = True
+                target = str(details_obj.get("next_stage", "")).strip()
+                next_stage = target or None
+            elif state == "step_continued":
+                step_waiting = False
+                next_stage = None
+
+            if stage == "run" and state in {"completed", "failed", "cancelled"}:
+                step_waiting = False
+                next_stage = None
+                pending_gate = None
+
+        if str(run.get("status", "")) != "running":
+            step_waiting = False
+            pending_gate = None
+            next_stage = None
+
+        return {
+            "pending_gate": pending_gate,
+            "step_waiting": step_waiting,
+            "next_stage": next_stage,
+        }
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -309,7 +362,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return
         run_id = parts[3]
         action = parts[5]
-        if action not in {"pause", "resume", "cancel", "approve", "reject"}:
+        if action not in {"pause", "resume", "cancel", "approve", "reject", "continue"}:
             self.send_error(HTTPStatus.BAD_REQUEST, "Unsupported action")
             return
 
@@ -461,6 +514,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
       background: #fff;
       color: var(--muted);
     }
+    .chip-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .subtle {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
     .chat-log {
       flex: 1;
       min-height: 0;
@@ -502,9 +566,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
       cursor: pointer;
       font-weight: 600;
     }
+    button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
     button.primary { background: var(--accent); color: #fff; }
     button.warn { border-color: var(--warn); color: var(--warn); }
     button.bad { border-color: var(--bad); color: var(--bad); }
+    button.info { border-color: #0f4c81; color: #0f4c81; }
+    button.ghost { border-color: var(--line); color: var(--muted); }
     .composer {
       padding: 12px;
       border-top: 1px solid var(--line);
@@ -565,6 +635,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
     .section { padding: 12px; }
     .section h3 { margin: 0 0 8px 0; font-size: 15px; }
     .kv { font-size: 13px; line-height: 1.5; color: var(--muted); }
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
     .task-columns {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -586,6 +663,72 @@ class DashboardHandler(BaseHTTPRequestHandler):
       margin: 2px 2px 0 0;
       font-size: 11px;
       background: #fff;
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 11px;
+      background: #fff;
+      margin-left: 6px;
+    }
+    .status-approved { border-color: #5ca57c; color: #166534; }
+    .status-rejected { border-color: #d06a6a; color: #a61b1b; }
+    .status-continued { border-color: #4f8cc7; color: #0f4c81; }
+    .status-sending { border-color: var(--warn); color: var(--warn); }
+    .status-superseded { border-color: var(--line); color: var(--muted); }
+    .task-item {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      padding: 8px;
+      margin-bottom: 6px;
+    }
+    .task-item:last-child { margin-bottom: 0; }
+    .task-item .title {
+      font-size: 12px;
+      font-weight: 700;
+      margin-bottom: 4px;
+      color: var(--ink);
+    }
+    .task-item .meta-line {
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.35;
+      margin-top: 2px;
+    }
+    .worktree-list {
+      display: grid;
+      gap: 8px;
+    }
+    .worktree-item {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      padding: 8px;
+    }
+    .worktree-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .worktree-path {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      font-size: 11px;
+      color: var(--muted);
+      flex-wrap: wrap;
+    }
+    .legend {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 8px;
+      line-height: 1.35;
     }
     .mono {
       font-family: \"IBM Plex Mono\", \"SFMono-Regular\", Menlo, monospace;
@@ -613,8 +756,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
           <h1>AgentKit</h1>
           <p>Chat-first orchestrator control surface</p>
         </div>
-        <div>
+        <div class=\"chip-row\">
           <span id=\"activeChip\" class=\"active-chip\">No active run</span>
+          <button class=\"primary\" id=\"newChatTopBtn\">New Chat</button>
         </div>
       </div>
       <div id=\"chatLog\" class=\"chat-log\"></div>
@@ -656,12 +800,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
               </label>
             </div>
             <div>
+              <label>Pacing
+                <select id=\"pacingSel\">
+                  <option value=\"realtime\" selected>realtime</option>
+                  <option value=\"step_major\">step_major</option>
+                </select>
+              </label>
+            </div>
+            <div>
               <label><input type=\"checkbox\" id=\"keepWorktrees\" /> Keep worktrees</label>
             </div>
           </div>
         </details>
         <div class=\"composer-row\">
-          <button class=\"primary\" id=\"sendBtn\">Send</button>
+          <button class=\"primary\" id=\"newChatBtn\">Start New Chat</button>
+          <button class=\"ghost\" id=\"noteBtn\">Send Note</button>
           <span id=\"composerStatus\" class=\"mono\"></span>
         </div>
         <div id=\"composerError\" class=\"error\"></div>
@@ -670,11 +823,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     <aside class=\"side\">
       <section class=\"panel section\">
-        <h3>Now Working</h3>
+        <div class=\"section-head\">
+          <h3>Now Working</h3>
+          <span id=\"modeChip\" class=\"status-badge\">Mode: realtime</span>
+        </div>
         <div id=\"nowWorking\" class=\"kv\">No run selected.</div>
         <div class=\"controls\">
           <button id=\"pauseBtn\" class=\"warn\">Pause</button>
           <button id=\"resumeBtn\">Resume</button>
+          <button id=\"continueBtn\" class=\"info\">Continue</button>
           <button id=\"cancelBtn\" class=\"bad\">Cancel</button>
         </div>
         <div style=\"margin-top:8px;\">
@@ -686,12 +843,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
       <section class=\"panel section\">
         <h3>Task Board</h3>
+        <div class=\"legend\">
+          Queued = ready, In Progress = developer active, QA = task-level approval, Integration = merge queue, Done = final, Blocked = requires intervention.
+        </div>
         <div id=\"taskBoard\" class=\"task-columns\"></div>
       </section>
 
       <section class=\"panel section\">
         <h3>Worktrees</h3>
-        <div id=\"worktreeMap\" class=\"mono\">No worktree data.</div>
+        <div class=\"subtle\" style=\"margin-bottom:8px;\">Task-to-branch mapping and worktree health for each lane.</div>
+        <div id=\"worktreeMap\" class=\"worktree-list\">No worktree data.</div>
       </section>
     </aside>
   </div>
@@ -701,8 +862,17 @@ let activeRun = null;
 let activeRunId = null;
 let eventSource = null;
 let refreshTimer = null;
+let pendingCardActions = new Map();
 
 const gateActions = new Set(["scope_lock", "integration_start", "release_start"]);
+const taskColumns = [
+  { key: "queued", label: "Queued", desc: "Ready / not started" },
+  { key: "in_progress", label: "In Progress", desc: "Developer active" },
+  { key: "qa", label: "QA", desc: "Task-level tester checks" },
+  { key: "integration", label: "Integration", desc: "Merge queue" },
+  { key: "done", label: "Done", desc: "Completed" },
+  { key: "blocked", label: "Blocked", desc: "Needs intervention" },
+];
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -745,44 +915,72 @@ function setError(text) {
   document.getElementById("composerError").textContent = text || "";
 }
 
+function pacingLabel(mode) {
+  return mode === "step_major" ? "Step (Major Stages)" : "Realtime";
+}
+
+function getRunPacingMode(run) {
+  if (!run || !run.metadata) return "realtime";
+  return run.metadata.pacing_mode || "realtime";
+}
+
 function activeChipText() {
   if (!activeRun) return "No active run";
   return `${activeRun.run_id} | ${activeRun.status} | ${activeRun.workflow}`;
 }
 
+function updateControls() {
+  const status = activeRun ? String(activeRun.status || "") : "";
+  const running = status === "running";
+  const paused = status === "paused";
+  const uiState = activeRun && activeRun.ui_state ? activeRun.ui_state : {};
+  const stepWaiting = Boolean(uiState && uiState.step_waiting);
+
+  const noteBtn = document.getElementById("noteBtn");
+  const pauseBtn = document.getElementById("pauseBtn");
+  const resumeBtn = document.getElementById("resumeBtn");
+  const continueBtn = document.getElementById("continueBtn");
+  const cancelBtn = document.getElementById("cancelBtn");
+
+  noteBtn.disabled = !running;
+  pauseBtn.disabled = !running;
+  resumeBtn.disabled = !paused;
+  continueBtn.disabled = !(running && stepWaiting);
+  cancelBtn.disabled = !(running || paused);
+}
+
 function renderNowWorking() {
   const node = document.getElementById("nowWorking");
   document.getElementById("activeChip").textContent = activeChipText();
+  const modeChip = document.getElementById("modeChip");
+  modeChip.textContent = `Mode: ${pacingLabel(getRunPacingMode(activeRun))}`;
   if (!activeRun) {
     node.textContent = "No run selected.";
     return;
   }
   const events = Array.isArray(activeRun.events) ? activeRun.events : [];
   const latest = events.length ? events[events.length - 1] : null;
+  const uiState = activeRun.ui_state || {};
+  const pendingGate = uiState.pending_gate || "-";
+  const nextStage = uiState.next_stage || "-";
   const lines = [
     `status: ${activeRun.status || "-"}`,
     `workflow: ${activeRun.workflow || "-"}`,
     `backend: ${activeRun.backend || "-"}`,
     `permissions: ${activeRun.permissions || "-"}`,
     `autonomy: ${activeRun.autonomy || "-"}`,
+    `pacing: ${getRunPacingMode(activeRun)}`,
     `stage: ${latest ? latest.stage : "-"}`,
     `persona: ${latest ? latest.role : "-"}`,
     `task: ${latest && latest.task_id ? latest.task_id : "-"}`,
+    `pending_gate: ${pendingGate}`,
+    `step_waiting: ${uiState.step_waiting ? "yes" : "no"}`,
+    `next_stage: ${nextStage}`,
   ];
   node.innerHTML = lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("");
 }
 
-function buildTaskSnapshot(tasks) {
-  const byId = new Map();
-  for (const task of tasks || []) {
-    if (!task || !task.task_id) continue;
-    byId.set(task.task_id, task);
-  }
-  return [...byId.values()];
-}
-
-function renderTaskBoard() {
-  const statuses = ["queued", "in_progress", "qa", "integration", "done", "blocked"];
+function taskBucket(state) {
   const mapState = {
     queued: "queued",
     in_progress: "in_progress",
@@ -793,25 +991,67 @@ function renderTaskBoard() {
     done: "done",
     blocked: "blocked",
   };
+  return mapState[String(state || "")] || "queued";
+}
+
+function buildTaskSnapshot(tasks) {
+  const byId = new Map();
+  for (const task of tasks || []) {
+    if (!task || !task.task_id) continue;
+    byId.set(task.task_id, task);
+  }
+  return [...byId.values()].sort((a, b) => String(a.task_id).localeCompare(String(b.task_id)));
+}
+
+function renderTaskCard(task) {
+  const deps = Array.isArray(task.dependencies) ? task.dependencies : [];
+  const depBadges = deps.length
+    ? deps.map((dep) => `<span class=\"pill\">dep:${escapeHtml(dep)}</span>`).join("")
+    : '<span class=\"pill\">dep:none</span>';
+  const assigned = task.assigned_agent || "unassigned";
+  const retries = Number(task.retries || 0);
+  const summary = task.summary || "";
+  return `
+    <div class=\"task-item\">
+      <div class=\"title\"><span class=\"pill\">${escapeHtml(task.task_id || "?")}</span> ${escapeHtml(summary)}</div>
+      <div class=\"meta-line\">agent: ${escapeHtml(assigned)} | retries: ${retries}</div>
+      <div class=\"meta-line\">${depBadges}</div>
+    </div>
+  `;
+}
+
+function renderTaskBoard() {
+  const tasks = buildTaskSnapshot(activeRun ? activeRun.tasks : []);
   const board = document.getElementById("taskBoard");
-  board.innerHTML = statuses
-    .map((status) => {
-      const tasks = buildTaskSnapshot(activeRun ? activeRun.tasks : []).filter((task) => {
-        const mapped = mapState[String(task.state || "")] || "queued";
-        return mapped === status;
-      });
-      const pills = tasks
-        .map((task) => `<span class=\"pill\">${escapeHtml(task.task_id)}</span>`)
-        .join("");
-      return `<div class=\"task-col\"><h4>${status}</h4>${pills || "<span class='mono'>none</span>"}</div>`;
+  board.innerHTML = taskColumns
+    .map((column) => {
+      const bucketTasks = tasks.filter((task) => taskBucket(task.state) === column.key);
+      const cards = bucketTasks.map((task) => renderTaskCard(task)).join("");
+      return `
+        <div class=\"task-col\">
+          <h4>${escapeHtml(column.label)} <span class=\"pill\">${bucketTasks.length}</span></h4>
+          <div class=\"subtle\" style=\"margin-bottom:6px;\">${escapeHtml(column.desc)}</div>
+          ${cards || "<div class='subtle'>none</div>"}
+        </div>
+      `;
     })
     .join("");
+}
+
+function worktreeStatusInfo(item) {
+  if (item && item.error) {
+    return { label: "error", cls: "status-rejected" };
+  }
+  if (item && item.created) {
+    return { label: "created", cls: "status-approved" };
+  }
+  return { label: "not-created", cls: "status-superseded" };
 }
 
 function renderWorktrees() {
   const node = document.getElementById("worktreeMap");
   if (!activeRun || !Array.isArray(activeRun.worktrees) || activeRun.worktrees.length === 0) {
-    node.textContent = "No worktree data.";
+    node.innerHTML = "<div class='subtle'>No worktree data.</div>";
     return;
   }
   const latestByTask = new Map();
@@ -820,12 +1060,29 @@ function renderWorktrees() {
     latestByTask.set(item.task_id, item);
   }
   const rows = [...latestByTask.values()]
+    .sort((a, b) => String(a.task_id).localeCompare(String(b.task_id)))
     .map((wt) => {
-      const created = wt.created ? "created" : "not-created";
-      return `${wt.task_id}\\n  branch: ${wt.branch || "-"}\\n  path: ${wt.path || "-"}\\n  state: ${created}${wt.error ? `\\n  error: ${wt.error}` : ""}`;
+      const status = worktreeStatusInfo(wt);
+      const path = wt.path || "-";
+      return `
+        <div class=\"worktree-item\">
+          <div class=\"worktree-header\">
+            <div>
+              <span class=\"pill\">task:${escapeHtml(wt.task_id || "?")}</span>
+              <span class=\"pill\">branch:${escapeHtml(wt.branch || "-")}</span>
+            </div>
+            <span class=\"status-badge ${status.cls}\">${escapeHtml(status.label)}</span>
+          </div>
+          <div class=\"worktree-path\">
+            <span>path: ${escapeHtml(path)}</span>
+            <button class=\"ghost\" data-copy=\"${escapeHtml(path)}\">Copy</button>
+          </div>
+          ${wt.error ? `<div class=\"error\" style=\"margin-top:6px;\">${escapeHtml(String(wt.error))}</div>` : ""}
+        </div>
+      `;
     })
-    .join("\\n\\n");
-  node.textContent = rows;
+    .join("");
+  node.innerHTML = rows;
 }
 
 function gateMetaFromEntry(entry) {
@@ -838,6 +1095,69 @@ function gateMetaFromEntry(entry) {
   return { stage };
 }
 
+function stepMetaFromEntry(entry) {
+  const meta = entry && entry.meta ? entry.meta : {};
+  const state = meta.state || "";
+  const details = meta.details || {};
+  const checkpoint = details.checkpoint || meta.stage || "";
+  if (entry.kind !== "step_wait") return null;
+  if (state !== "step_waiting") return null;
+  if (!checkpoint) return null;
+  return { checkpoint, nextStage: details.next_stage || "" };
+}
+
+function entryActionInfo(entry) {
+  const gate = gateMetaFromEntry(entry);
+  if (gate) {
+    return { key: `gate:${gate.stage}`, type: "gate", stage: gate.stage };
+  }
+  const step = stepMetaFromEntry(entry);
+  if (step) {
+    return {
+      key: `step:${step.checkpoint}`,
+      type: "step",
+      checkpoint: step.checkpoint,
+      nextStage: step.nextStage,
+    };
+  }
+  return null;
+}
+
+function buildResolutionMap(events) {
+  const out = new Map();
+  for (const event of events || []) {
+    const stage = String(event.stage || "").trim();
+    const state = String(event.state || "").trim();
+    const details = event.details && typeof event.details === "object" ? event.details : {};
+    if (state === "gate_approved") {
+      out.set(`gate:${stage}`, "approved");
+    } else if (state === "gate_rejected") {
+      out.set(`gate:${stage}`, "rejected");
+    } else if (state === "step_continued") {
+      const checkpoint = String(details.checkpoint || stage || "").trim();
+      if (checkpoint) {
+        out.set(`step:${checkpoint}`, "continued");
+      }
+    }
+  }
+  return out;
+}
+
+function latestOpenCardIndexes(entries, resolutions) {
+  const out = new Map();
+  for (let i = 0; i < entries.length; i += 1) {
+    const info = entryActionInfo(entries[i]);
+    if (!info) continue;
+    if (resolutions.has(info.key)) continue;
+    out.set(info.key, i);
+  }
+  return out;
+}
+
+function statusBadge(text, cls) {
+  return `<span class=\"status-badge ${cls}\">${escapeHtml(text)}</span>`;
+}
+
 function renderChat() {
   const node = document.getElementById("chatLog");
   const hadExistingEntries = node.childElementCount > 0;
@@ -846,11 +1166,19 @@ function renderChat() {
     node.scrollHeight - node.scrollTop - node.clientHeight < 60;
   node.innerHTML = "";
   const entries = activeRun && Array.isArray(activeRun.chat) ? activeRun.chat : [];
+  const events = activeRun && Array.isArray(activeRun.events) ? activeRun.events : [];
+  const resolutions = buildResolutionMap(events);
+  for (const key of [...pendingCardActions.keys()]) {
+    if (!activeRun || activeRun.status !== "running" || resolutions.has(key)) {
+      pendingCardActions.delete(key);
+    }
+  }
+  const latestOpen = latestOpenCardIndexes(entries, resolutions);
   if (!entries.length) {
     node.innerHTML = '<div class="msg system"><div class="meta">system</div>No chat entries yet. Start a run from the input below.</div>';
     return;
   }
-  for (const entry of entries) {
+  entries.forEach((entry, idx) => {
     const role = entry.role || "system";
     const kind = entry.kind || "message";
     const meta = entry.meta || {};
@@ -869,22 +1197,53 @@ function renderChat() {
     }
     wrap.appendChild(contentNode);
 
-    const gateMeta = gateMetaFromEntry(entry);
-    if (gateMeta && activeRun && activeRun.status === "running") {
+    const actionInfo = entryActionInfo(entry);
+    if (actionInfo) {
       wrap.classList.add("approval");
+      const resolved = resolutions.get(actionInfo.key) || null;
+      const pendingAction = pendingCardActions.get(actionInfo.key) || null;
+      const isLatestOpen = latestOpen.get(actionInfo.key) === idx;
       const actions = document.createElement("div");
       actions.className = "btn-row";
-      const approve = document.createElement("button");
-      approve.className = "primary";
-      approve.textContent = "Approve";
-      approve.onclick = () => sendAction("approve", gateMeta.stage);
-      const reject = document.createElement("button");
-      reject.className = "bad";
-      reject.textContent = "Reject";
-      reject.onclick = () => sendAction("reject", gateMeta.stage);
-      actions.appendChild(approve);
-      actions.appendChild(reject);
-      wrap.appendChild(actions);
+
+      if (pendingAction) {
+        actions.innerHTML = statusBadge("Sending...", "status-sending");
+        wrap.appendChild(actions);
+      } else if (resolved) {
+        const cls = resolved === "approved" ? "status-approved" : resolved === "rejected" ? "status-rejected" : "status-continued";
+        actions.innerHTML = statusBadge(resolved, cls);
+        wrap.appendChild(actions);
+      } else if (!isLatestOpen) {
+        actions.innerHTML = statusBadge("superseded", "status-superseded");
+        wrap.appendChild(actions);
+      } else if (activeRun && activeRun.status === "running") {
+        if (actionInfo.type === "gate") {
+          const approve = document.createElement("button");
+          approve.className = "primary";
+          approve.textContent = "Approve";
+          approve.onclick = () =>
+            sendAction("approve", { gate: actionInfo.stage }, actionInfo.key);
+          const reject = document.createElement("button");
+          reject.className = "bad";
+          reject.textContent = "Reject";
+          reject.onclick = () =>
+            sendAction("reject", { gate: actionInfo.stage }, actionInfo.key);
+          actions.appendChild(approve);
+          actions.appendChild(reject);
+        } else if (actionInfo.type === "step") {
+          const cont = document.createElement("button");
+          cont.className = "info";
+          cont.textContent = "Continue";
+          cont.onclick = () =>
+            sendAction(
+              "continue",
+              { checkpoint: actionInfo.checkpoint, next_stage: actionInfo.nextStage || "" },
+              actionInfo.key,
+            );
+          actions.appendChild(cont);
+        }
+        wrap.appendChild(actions);
+      }
     }
 
     if (meta && Object.keys(meta).length) {
@@ -895,7 +1254,7 @@ function renderChat() {
     }
 
     node.appendChild(wrap);
-  }
+  });
   if (wasNearBottom) {
     node.scrollTop = node.scrollHeight;
   }
@@ -906,6 +1265,7 @@ function renderAll() {
   renderTaskBoard();
   renderWorktrees();
   renderChat();
+  updateControls();
 }
 
 async function refreshRunsDropdown() {
@@ -989,33 +1349,23 @@ async function loadActiveRun() {
   subscribeEvents(activeRunId);
 }
 
-async function startOrSendMessage() {
+async function startNewChat() {
   setError("");
   const input = document.getElementById("promptInput");
   const message = input.value.trim();
   if (!message) {
-    setError("Please type a request first.");
+    setError("Please type the new request first.");
     return;
   }
   try {
-    setStatus("sending...");
-    if (activeRun && activeRun.status === "running") {
-      await api("/api/chat/message", {
-        method: "POST",
-        body: JSON.stringify({ run_id: activeRun.run_id, message }),
-      });
-      input.value = "";
-      await loadRun(activeRun.run_id);
-      setStatus("message appended");
-      return;
-    }
-
+    setStatus("starting run...");
     const payload = {
       message,
       workflow: document.getElementById("workflowSel").value,
       backend: document.getElementById("backendSel").value,
       permissions: document.getElementById("permissionsSel").value,
       autonomy: document.getElementById("autonomySel").value,
+      pacing_mode: document.getElementById("pacingSel").value,
       keep_worktrees: document.getElementById("keepWorktrees").checked,
     };
     const started = await api("/api/chat/start", {
@@ -1031,38 +1381,102 @@ async function startOrSendMessage() {
   }
 }
 
-async function sendAction(action, gate) {
-  if (!activeRunId) {
-    setError("No active run selected.");
+async function sendNote() {
+  setError("");
+  if (!activeRun || activeRun.status !== "running") {
+    setError("Send Note requires an active running run.");
+    return;
+  }
+  const input = document.getElementById("promptInput");
+  const message = input.value.trim();
+  if (!message) {
+    setError("Please type a note first.");
     return;
   }
   try {
-    setStatus(`${action}...`);
-    await api(`/api/runs/${activeRunId}/actions/${action}`, {
+    setStatus("sending note...");
+    await api("/api/chat/message", {
       method: "POST",
-      body: JSON.stringify({ meta: gate ? { gate } : {} }),
+      body: JSON.stringify({ run_id: activeRun.run_id, message }),
     });
-    await loadRun(activeRunId);
-    setStatus(`${action} sent`);
+    input.value = "";
+    await loadRun(activeRun.run_id);
+    setStatus("note sent");
   } catch (err) {
     setError(err.message || String(err));
     setStatus("");
   }
 }
 
-document.getElementById("sendBtn").addEventListener("click", startOrSendMessage);
+async function sendAction(action, meta = {}, cardKey = null) {
+  if (!activeRunId) {
+    setError("No active run selected.");
+    return;
+  }
+  if (cardKey) {
+    pendingCardActions.set(cardKey, action);
+    renderAll();
+  }
+  try {
+    setStatus(`${action}...`);
+    await api(`/api/runs/${activeRunId}/actions/${action}`, {
+      method: "POST",
+      body: JSON.stringify({ meta }),
+    });
+    await loadRun(activeRunId);
+    setStatus(`${action} sent`);
+  } catch (err) {
+    setError(err.message || String(err));
+    setStatus("");
+    if (cardKey) {
+      pendingCardActions.delete(cardKey);
+      renderAll();
+    }
+  } finally {
+    if (cardKey && (!activeRun || activeRun.status !== "running")) {
+      pendingCardActions.delete(cardKey);
+      renderAll();
+    }
+  }
+}
+
+document.getElementById("newChatBtn").addEventListener("click", startNewChat);
+document.getElementById("newChatTopBtn").addEventListener("click", startNewChat);
+document.getElementById("noteBtn").addEventListener("click", sendNote);
 document.getElementById("pauseBtn").addEventListener("click", () => sendAction("pause"));
 document.getElementById("resumeBtn").addEventListener("click", () => sendAction("resume"));
+document.getElementById("continueBtn").addEventListener("click", () => sendAction("continue"));
 document.getElementById("cancelBtn").addEventListener("click", () => sendAction("cancel"));
 document.getElementById("runSwitch").addEventListener("change", async (ev) => {
   const runId = ev.target.value;
   if (!runId) return;
   await loadRun(runId);
 });
+document.getElementById("worktreeMap").addEventListener("click", async (ev) => {
+  const target = ev.target;
+  if (!(target instanceof HTMLElement)) return;
+  const value = target.getAttribute("data-copy");
+  if (!value) return;
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(value);
+    } else {
+      const tmp = document.createElement("textarea");
+      tmp.value = value;
+      document.body.appendChild(tmp);
+      tmp.select();
+      document.execCommand("copy");
+      document.body.removeChild(tmp);
+    }
+    setStatus("path copied");
+  } catch {
+    setError("Could not copy path.");
+  }
+});
 document.getElementById("promptInput").addEventListener("keydown", (ev) => {
   if ((ev.metaKey || ev.ctrlKey) && ev.key === "Enter") {
     ev.preventDefault();
-    startOrSendMessage();
+    startNewChat();
   }
 });
 
