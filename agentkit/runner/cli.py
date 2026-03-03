@@ -60,7 +60,7 @@ def print_run_usage() -> None:
 
 
 def print_dashboard_usage() -> None:
-    print("Usage: agentkit dashboard [--run-id <id>] [--port <port>]")
+    print("Usage: agentkit dashboard [--port <port>] [--run-id <id>]")
 
 
 def print_runs_usage() -> None:
@@ -499,5 +499,4 @@ def main() -> None:
     print("List runs:")
     print("  agentkit runs list")
     print("Launch dashboard:")
-    print("  agentkit dashboard --run-id <id> --port 8787")
-
+    print("  agentkit dashboard --port 8787")

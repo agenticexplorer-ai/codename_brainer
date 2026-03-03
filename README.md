@@ -101,7 +101,17 @@ agentkit runs show <run-id>
 Launch local dashboard:
 
 ```bash
-agentkit dashboard --run-id <run-id> --port 8787
+agentkit dashboard --port 8787
 ```
 
 Then open `http://127.0.0.1:8787`.
+
+## Chat-first dashboard
+
+1. Open the dashboard.
+2. Type your request in the chat box.
+3. Press `Send` to start a run (defaults: `team_factory_v1`, `stub`, `read_only`, `mixed`).
+4. Watch live persona/stage/task/worktree updates in the right-side panels.
+5. Approve or reject gate cards inline in chat when they appear.
+
+You can still switch runs from the run dropdown, and CLI-driven runs remain supported.

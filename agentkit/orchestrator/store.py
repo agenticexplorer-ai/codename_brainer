@@ -24,6 +24,7 @@ class RunStore:
         self.events_file = self.run_dir / "events.jsonl"
         self.tasks_file = self.run_dir / "tasks.jsonl"
         self.worktrees_file = self.run_dir / "worktrees.jsonl"
+        self.chat_file = self.run_dir / "chat.jsonl"
 
     def write_run(self, run_state: RunState) -> None:
         payload = {
@@ -92,6 +93,24 @@ class RunStore:
         path = self.artifacts_dir / f"{safe_name}.json"
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
+    def write_chat(
+        self,
+        *,
+        role: str,
+        content: str,
+        kind: str = "message",
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        entry = {
+            "timestamp": utc_now_iso(),
+            "run_id": self.run_id,
+            "role": role,
+            "kind": kind,
+            "content": content,
+            "meta": meta or {},
+        }
+        self._append_jsonl(self.chat_file, entry)
+
     def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
         with path.open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
@@ -122,3 +141,35 @@ def load_run(state_root: Path, run_id: str) -> dict[str, Any]:
         raise FileNotFoundError(f"Run not found: {run_id}")
     return json.loads(run_file.read_text(encoding="utf-8"))
 
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            out.append(payload)
+    return out
+
+
+def append_chat_message(
+    state_root: Path,
+    run_id: str,
+    *,
+    role: str,
+    content: str,
+    kind: str = "message",
+    meta: dict[str, Any] | None = None,
+) -> None:
+    run_file = state_root / run_id / "run.json"
+    if not run_file.exists():
+        raise FileNotFoundError(f"Run not found: {run_id}")
+    store = RunStore(state_root, run_id)
+    store.write_chat(role=role, content=content, kind=kind, meta=meta)

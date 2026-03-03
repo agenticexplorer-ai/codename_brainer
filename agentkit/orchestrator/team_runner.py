@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
+import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict
@@ -32,6 +34,7 @@ class TeamOrchestrator:
         keep_worktrees: bool,
         logs_dir: Path,
         state_runs_dir: Path,
+        interactive_gates: bool = True,
     ) -> None:
         self.repo_root = repo_root
         self.workflow_name = workflow_name
@@ -41,6 +44,7 @@ class TeamOrchestrator:
         self.permissions = permissions
         self.autonomy = autonomy
         self.keep_worktrees = keep_worktrees
+        self.interactive_gates = interactive_gates
         self.logs_dir = logs_dir
         self.logs_dir.mkdir(parents=True, exist_ok=True)
         self.state_runs_dir = state_runs_dir
@@ -61,6 +65,7 @@ class TeamOrchestrator:
             keep_worktrees=self.keep_worktrees,
         )
         self.role_thread_ids: dict[str, str] = {}
+        self.run_state: RunState | None = None
         self.backend = build_backend(
             backend_name=self.backend_name,
             permissions=self.permissions,
@@ -70,6 +75,7 @@ class TeamOrchestrator:
         )
         self.backend_lock = threading.Lock()
         self.store_lock = threading.Lock()
+        self.action_lock = threading.Lock()
         self.log_file = self.logs_dir / f"run_{self.workflow_name}_{self.run_id}.jsonl"
         self.max_task_retries = int(
             self.scheduler_policies.get("defaults", {}).get("max_task_retries", 2)
@@ -80,6 +86,10 @@ class TeamOrchestrator:
         self.fail_fast = bool(
             self.scheduler_policies.get("defaults", {}).get("fail_fast_on_backend_errors", True)
         )
+        self.actions_file = self.run_store.run_dir / "actions.jsonl"
+        self.actions_cursor = 0
+        self.pending_actions: list[dict[str, Any]] = []
+        self.cancel_requested = False
 
     def run(self) -> int:
         run_state = RunState(
@@ -95,6 +105,7 @@ class TeamOrchestrator:
             updated_at=utc_now_iso(),
             metadata={"kind": "team_orchestrator"},
         )
+        self.run_state = run_state
         self.run_store.write_run(run_state)
 
         try:
@@ -177,19 +188,29 @@ class TeamOrchestrator:
             )
             self._event("cicd", "cicd_simulation", "completed", details=cicd)
 
-            run_state.status = "completed"
-            run_state.updated_at = utc_now_iso()
-            self.run_store.write_run(run_state)
+            self._set_run_status("completed")
             self._event("system", "run", "completed", details={"run_id": self.run_id})
+            self.run_store.write_chat(
+                role="system",
+                kind="summary",
+                content=f"Run {self.run_id} completed successfully.",
+                meta={"status": "completed"},
+            )
             print(f"✅ Team run complete. Run ID: {self.run_id}")
             print(f"State: {self.run_store.run_dir}")
             return 0
         except Exception as exc:
-            run_state.status = "failed"
-            run_state.updated_at = utc_now_iso()
-            run_state.metadata["error"] = str(exc)
-            self.run_store.write_run(run_state)
-            self._event("system", "run", "failed", error=str(exc))
+            if self.run_state is not None:
+                self.run_state.metadata["error"] = str(exc)
+            final_status = "cancelled" if (self.run_state and self.run_state.status == "cancelled") else "failed"
+            self._set_run_status(final_status)
+            self._event("system", "run", final_status, error=str(exc))
+            self.run_store.write_chat(
+                role="system",
+                kind="summary",
+                content=f"Run {self.run_id} {final_status}: {exc}",
+                meta={"status": final_status},
+            )
             print(f"Run failed: {exc}")
             return 1
         finally:
@@ -227,6 +248,7 @@ class TeamOrchestrator:
         require_approve: bool = False,
         require_pipeline_pass: bool = False,
     ) -> dict[str, Any]:
+        self._sync_control_actions(wait_if_paused=True)
         agent_label = agent_id or f"{role}-1"
         self._event(role, stage_id, "started", agent_id=agent_label, task_id=task_id)
         output = self._call_backend(
@@ -551,6 +573,7 @@ class TeamOrchestrator:
             return out if isinstance(out, dict) else {"error": "backend returned non-dict output"}
 
     def _gate(self, gate: str, *, requested_by: str, details: dict[str, Any]) -> bool:
+        self._sync_control_actions(wait_if_paused=True)
         requires_prompt = False
         if self.autonomy == "human_in_loop":
             requires_prompt = True
@@ -571,7 +594,7 @@ class TeamOrchestrator:
             self._event(requested_by, gate, "gate_approved", details={"mode": self.autonomy})
             return True
 
-        answer = self._prompt_for_gate(gate, requested_by, details)
+        answer = self._wait_for_gate_decision(gate, requested_by, details)
         if answer:
             self._event(requested_by, gate, "gate_approved", details={"mode": self.autonomy})
             return True
@@ -586,6 +609,148 @@ class TeamOrchestrator:
         except EOFError:
             answer = "n"
         return answer in {"y", "yes"}
+
+    def _wait_for_gate_decision(
+        self,
+        gate: str,
+        requested_by: str,
+        details: dict[str, Any],
+    ) -> bool:
+        if self.interactive_gates and sys.stdin.isatty():
+            return self._prompt_for_gate(gate, requested_by, details)
+
+        self._event(
+            requested_by,
+            gate,
+            "gate_waiting",
+            details=details,
+        )
+        while True:
+            self._sync_control_actions(wait_if_paused=True)
+            for action in self._drain_pending_actions():
+                action_name = str(action.get("action", "")).lower()
+                meta = action.get("meta", {})
+                meta_gate = (
+                    str(meta.get("gate", "")).strip()
+                    if isinstance(meta, dict)
+                    else ""
+                )
+                if meta_gate and meta_gate != gate:
+                    continue
+                if action_name == "approve":
+                    return True
+                if action_name == "reject":
+                    return False
+                if action_name == "cancel":
+                    raise RuntimeError("run cancelled by user")
+            time.sleep(1.0)
+
+    def _set_run_status(self, status: str) -> None:
+        if self.run_state is None:
+            return
+        if self.run_state.status == status:
+            return
+        self.run_state.status = status  # type: ignore[assignment]
+        self.run_state.updated_at = utc_now_iso()
+        self.run_store.write_run(self.run_state)
+
+    def _read_new_actions(self) -> list[dict[str, Any]]:
+        with self.action_lock:
+            if not self.actions_file.exists():
+                return []
+            lines = self.actions_file.read_text(encoding="utf-8").splitlines()
+            if self.actions_cursor >= len(lines):
+                return []
+            out: list[dict[str, Any]] = []
+            for raw in lines[self.actions_cursor :]:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    payload = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    out.append(payload)
+            self.actions_cursor = len(lines)
+            return out
+
+    def _sync_control_actions(self, *, wait_if_paused: bool) -> None:
+        paused = self.run_state is not None and self.run_state.status == "paused"
+        while True:
+            progressed = False
+            for action in self._read_new_actions():
+                action_name = str(action.get("action", "")).lower()
+                if action_name == "pause":
+                    paused = True
+                    self._set_run_status("paused")
+                    self._event("system", "run", "paused", details={"source": "action"})
+                    progressed = True
+                    continue
+                if action_name == "resume":
+                    paused = False
+                    self._set_run_status("running")
+                    self._event("system", "run", "resumed", details={"source": "action"})
+                    progressed = True
+                    continue
+                if action_name == "cancel":
+                    self.cancel_requested = True
+                    self._set_run_status("cancelled")
+                    self._event("system", "run", "cancelled", details={"source": "action"})
+                    raise RuntimeError("run cancelled by user")
+                self._enqueue_pending_action(action)
+            if paused and wait_if_paused:
+                time.sleep(1.0)
+                continue
+            if not progressed:
+                return
+
+    def _drain_pending_actions(self) -> list[dict[str, Any]]:
+        with self.action_lock:
+            out = list(self.pending_actions)
+            self.pending_actions = []
+            return out
+
+    def _enqueue_pending_action(self, action: dict[str, Any]) -> None:
+        with self.action_lock:
+            self.pending_actions.append(action)
+
+    def _event_message(
+        self,
+        *,
+        role: str,
+        stage: str,
+        state: str,
+        task_id: str | None,
+        details: dict[str, Any] | None,
+        error: str | None,
+    ) -> tuple[str, str]:
+        if error:
+            return "message", f"{role} reported an error at {stage}: {error}"
+        if stage == "run" and state == "completed":
+            return "summary", "Run completed."
+        if stage == "run" and state in {"failed", "cancelled"}:
+            return "summary", f"Run {state}."
+        if state == "gate_requested":
+            return "approval", f"Approval requested: {stage}"
+        if state == "started":
+            suffix = f" (task {task_id})" if task_id else ""
+            return "message", f"{role} started {stage}{suffix}."
+        if state == "completed":
+            suffix = f" (task {task_id})" if task_id else ""
+            return "message", f"{role} completed {stage}{suffix}."
+        if state == "failed":
+            return "message", f"{role} failed {stage}."
+        if state in {"paused", "resumed", "cancelled"}:
+            return "message", f"Run {state}."
+        if state in {"gate_approved", "gate_rejected"}:
+            verdict = "approved" if state == "gate_approved" else "rejected"
+            return "message", f"Gate {stage} {verdict}."
+        if state == "gate_waiting":
+            return "approval", f"Waiting for approval on gate {stage}."
+        if details and "message" in details:
+            return "message", str(details["message"])
+        return "message", f"{role} {state} at {stage}."
 
     def _append_run_log(self, payload: dict[str, Any]) -> None:
         with self.store_lock:
@@ -612,6 +777,26 @@ class TeamOrchestrator:
                 task_id=task_id,
                 details=details,
                 error=error,
+            )
+            kind, content = self._event_message(
+                role=role,
+                stage=stage,
+                state=state,
+                task_id=task_id,
+                details=details,
+                error=error,
+            )
+            self.run_store.write_chat(
+                role="orchestrator",
+                kind=kind,
+                content=content,
+                meta={
+                    "stage": stage,
+                    "state": state,
+                    "role": role,
+                    "task_id": task_id,
+                    "details": details or {},
+                },
             )
 
     def _write_task(self, task: TaskItem) -> None:
